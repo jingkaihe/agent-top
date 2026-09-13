@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-13
+
 ### Added
 - **DeepSeek prices.** `deepseek-v4-pro`, `deepseek-flash` and its retired name `deepseek-v4-flash` are priced at DeepSeek's peak list rate (checked 2026-09-13; off-peak is half). OpenCode rows keep OpenCode's own cost, and the rates divide it between input, cache and output, so the context section of an OpenCode session on DeepSeek now shows what each source has cost instead of `-`.
 - **Context by source for OpenCode.** OpenCode rows now get the detail pane's `context` section, `CONTEXT BY SOURCE` in `--once` and `context` in `--json`, like Claude Code, Codex and Gemini. Each OpenCode assistant message is one model response with its own token counts, and its tool parts are the calls whose results the next response carries, so the ledger is fed message by message over the whole session, MCP calls filed under their server. A compaction is exact: OpenCode marks the summary reply, and the ledger resets after it. OpenCode stores one cost per reply, so the price table divides it between input, cache and output and the rows add up to OpenCode's own prompt-side figure; a model the table does not price, such as DeepSeek, shows tokens with `-` for cost. Subagent sessions fold into their parent.
