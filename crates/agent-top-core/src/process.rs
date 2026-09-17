@@ -77,8 +77,13 @@ impl ProcessScanner {
     /// to be asked for. Each is read once per process (`OnlyIfNotSet`): a
     /// command line never changes, and an agent's working directory does not
     /// change in practice, so the per-tick cost stays at memory and CPU.
+    /// `nothing()` still includes Linux tasks by default. Exclude them: worker
+    /// threads share the process's command line and RSS, and process CPU already
+    /// includes their work. Treating them as children invents subagents and
+    /// counts the same resources again for every thread.
     fn refresh_kind() -> ProcessRefreshKind {
         ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_memory()
             .with_cpu()
             .with_exe(UpdateKind::OnlyIfNotSet)
@@ -344,6 +349,47 @@ mod tests {
             start_time: 0,
             run_time: 1,
         }
+    }
+
+    #[test]
+    fn refreshes_processes_without_tasks() {
+        let kind = ProcessScanner::refresh_kind();
+        assert!(!kind.tasks(), "Linux threads share their process's RSS and must not become tree nodes");
+        assert!(kind.memory());
+        assert!(kind.cpu());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scanner_excludes_live_worker_threads() {
+        use std::sync::mpsc;
+
+        std::thread::scope(|scope| {
+            let (ready, tid) = mpsc::channel();
+            let (_release, wait) = mpsc::channel::<()>();
+            scope.spawn(move || {
+                let path = std::fs::read_link("/proc/thread-self").unwrap();
+                let tid: u32 = path.file_name().unwrap().to_str().unwrap().parse().unwrap();
+                ready.send(tid).unwrap();
+                // Stay alive during both scans; dropping the sender also releases
+                // the worker if an assertion panics.
+                let _ = wait.recv();
+            });
+            let tid = tid.recv().unwrap();
+            let pid = std::process::id();
+            assert_ne!(tid, pid);
+
+            let mut scanner = ProcessScanner::new();
+            // Include the test process so we can check that only its leader is
+            // kept, independently of agent-top's normal self-PID exclusion.
+            scanner.self_pid = None;
+            for _ in 0..2 {
+                let procs = scanner.processes();
+                assert!(procs.iter().any(|p| p.pid == pid), "the process itself must remain visible");
+                assert!(!procs.iter().any(|p| p.pid == tid), "a worker thread is not a child process");
+                scanner.refresh();
+            }
+        });
     }
 
     #[test]
