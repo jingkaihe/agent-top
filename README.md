@@ -41,6 +41,13 @@ in your agents: `agent-top` reads the transcripts the harnesses already write
 and the process table the OS already keeps. Start it in any terminal while
 your agents run.
 
+The TUI automatically uses **Catppuccin Mocha** for dark terminals and
+**Catppuccin Latte** for light terminals. It detects the terminal's colours at
+startup; if querying is unsupported, it uses `COLORFGBG` when available, otherwise
+defaults to Mocha. Restart `agent-top` after changing your terminal's theme.
+True-colour terminals get the full palette; other terminals get its nearest
+256-colour approximation. Plain-text and JSON output are unchanged.
+
 What to look at first:
 
 - **STATE** tells you who is working and who is waiting for you.
