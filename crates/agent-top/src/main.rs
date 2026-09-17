@@ -4,6 +4,7 @@ mod app;
 mod format;
 mod pane;
 mod report;
+mod theme;
 mod trace;
 mod ui;
 mod update;
@@ -256,8 +257,11 @@ fn main() -> Result<()> {
         pinned: cli.command.as_ref().and_then(Command::panel),
         forwarded: forwarded_args(&cli),
     };
+    // Query before ratatui takes ownership of terminal input/raw mode. Plain
+    // text, JSON, reports and shell completions never query the terminal.
+    let theme = theme::Theme::detect();
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut source, &start);
+    let result = run(&mut terminal, &mut source, &start, &theme);
     ratatui::restore();
     match result? {
         Exit::Quit => Ok(()),
@@ -283,7 +287,7 @@ struct Start {
     forwarded: Vec<String>,
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, source: &mut Source, start: &Start) -> Result<Exit> {
+fn run(terminal: &mut ratatui::DefaultTerminal, source: &mut Source, start: &Start, theme: &theme::Theme) -> Result<Exit> {
     let interval = start.interval;
     let mut app = app::App::new(source.collect());
     if let Some(p) = start.pinned {
@@ -302,7 +306,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, source: &mut Source, start: &Sta
     }
     let mut last_tick = Instant::now();
     loop {
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        terminal.draw(|f| ui::draw(f, &mut app, theme))?;
         let timeout = interval.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)?
             && let Event::Key(key) = event::read()?

@@ -3,6 +3,7 @@
 
 use crate::app::{App, DetailView, Overlay, Panel};
 use crate::format::{age, bytes, cost, cpu_cell, duration_ms, mem_cell, short_cmd, short_model, tokens, tokens_cell, truncate};
+use crate::theme::{Ramp, Theme};
 use agent_top_core::{Agent, AgentState, Attribution, McpMatch, OrphanOrigin, ProcKind, ProcNode, SpanKind, ToolSpan};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -11,22 +12,16 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState, Wrap};
 use std::time::{Duration, SystemTime};
 
-const ACCENT: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
-/// Panel borders. Bright enough to actually divide the screen; DarkGray reads
-/// as noise next to the meters rather than as structure.
-const BORDER_RGB: (u8, u8, u8) = (0x8b, 0x96, 0xa8);
-
 /// Column widths of the totals block in the header. The label column is wide
 /// enough that the longest label still leaves a gap before the number.
 const STAT_LABEL_W: usize = 10;
 const STAT_VALUE_W: usize = 7;
 
-fn state_style(s: AgentState) -> Style {
+fn state_style(s: AgentState, theme: &Theme) -> Style {
     match s {
-        AgentState::Running => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        AgentState::Idle => Style::default().fg(Color::Yellow),
-        AgentState::Stopped => Style::default().fg(DIM),
+        AgentState::Running => Style::default().fg(theme.green).add_modifier(Modifier::BOLD),
+        AgentState::Idle => Style::default().fg(theme.yellow),
+        AgentState::Stopped => Style::default().fg(theme.dim),
     }
 }
 
@@ -37,7 +32,7 @@ fn state_style(s: AgentState) -> Style {
 // hotter. The texture comes from the seven-eighths block, which most terminal
 // fonts render with a one-pixel gap at the cell's right edge, so a run of them
 // looks like segments rather than one slab. Unfilled cells keep the same
-// texture in near-black, which is what makes the track visible as a channel.
+// texture in the theme's surface colour, making the track visible as a channel.
 
 /// Filled cell of a meter.
 const METER_FULL: &str = "▉";
@@ -51,65 +46,6 @@ const METER_TRACK: &str = "▏";
 const METER_FULL_CH: char = '▉';
 #[cfg(test)]
 const METER_TIP_CH: char = '▸';
-
-/// A three-stop colour ramp, interpolated across a meter's length.
-struct Ramp([(u8, u8, u8); 3]);
-
-/// Duration of a finished tool call: cool when short, hot when it eats the window.
-const RAMP_OK: Ramp = Ramp([(0x4c, 0xc3, 0x8a), (0xd8, 0xc0, 0x4a), (0xe0, 0x7b, 0x39)]);
-/// A subagent's call. A different hue family so a sidechain is obvious at a
-/// glance, still ramped by duration.
-const RAMP_SUBAGENT: Ramp = Ramp([(0x4a, 0x8f, 0xe0), (0x5a, 0xc8, 0xd8), (0xb0, 0x6a, 0xe0)]);
-/// A call that has not come back yet.
-const RAMP_OPEN: Ramp = Ramp([(0xb0, 0x8a, 0x2a), (0xe0, 0xc0, 0x40), (0xf5, 0xe8, 0x8a)]);
-/// A call the harness reported as failed. Red family, so it reads as wrong and
-/// not merely slow.
-const RAMP_ERROR: Ramp = Ramp([(0x9c, 0x2b, 0x4e), (0xdc, 0x3c, 0x50), (0xff, 0x77, 0x94)]);
-/// The model thinking: deliberately muted, so tool calls stay the foreground
-/// and the gaps between them read as labelled rather than loud.
-const RAMP_INFERENCE: Ramp = Ramp([(0x4e, 0x4e, 0x62), (0x6e, 0x6e, 0x8c), (0x90, 0x90, 0xb4)]);
-/// Host CPU and memory, btop's classic green-amber-red.
-const RAMP_LOAD: Ramp = Ramp([(0x4c, 0xc3, 0x8a), (0xd8, 0xc0, 0x4a), (0xe0, 0x45, 0x45)]);
-
-const TRACK_RGB: (u8, u8, u8) = (0x3a, 0x3a, 0x3a);
-
-impl Ramp {
-    /// Colour at `t` in 0..=1, linear between the three stops.
-    fn rgb_at(&self, t: f64) -> (u8, u8, u8) {
-        let t = t.clamp(0.0, 1.0);
-        let (a, b, local) = if t < 0.5 { (self.0[0], self.0[1], t * 2.0) } else { (self.0[1], self.0[2], (t - 0.5) * 2.0) };
-        let mix = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * local).round() as u8;
-        (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
-    }
-
-    fn at(&self, t: f64) -> Color {
-        term_color(self.rgb_at(t))
-    }
-}
-
-/// True colour where the terminal advertises it, the closest xterm-256 cube
-/// entry everywhere else. Without the fallback a 256-colour terminal renders
-/// the whole ramp as one flat approximation and the gradient disappears.
-fn truecolor() -> bool {
-    use std::sync::OnceLock;
-    static TRUECOLOR: OnceLock<bool> = OnceLock::new();
-    *TRUECOLOR.get_or_init(|| std::env::var("COLORTERM").map(|v| v.contains("truecolor") || v.contains("24bit")).unwrap_or(false))
-}
-
-fn term_color(rgb: (u8, u8, u8)) -> Color {
-    if truecolor() { Color::Rgb(rgb.0, rgb.1, rgb.2) } else { Color::Indexed(xterm256(rgb)) }
-}
-
-/// Nearest entry in the xterm-256 palette: the 24-step grey ramp for colours
-/// that are near-grey, the 6x6x6 cube otherwise.
-fn xterm256((r, g, b): (u8, u8, u8)) -> u8 {
-    if r.abs_diff(g) < 12 && g.abs_diff(b) < 12 && r.abs_diff(b) < 12 {
-        let level = (r as u16 + g as u16 + b as u16) / 3;
-        return 232 + (level * 23 / 255) as u8;
-    }
-    let axis = |v: u8| (v as u16 * 5 / 255) as u8;
-    16 + 36 * axis(r) + 6 * axis(g) + axis(b)
-}
 
 /// `len` textured cells whose colour sweeps `ramp` from `t0` to `t1`. `tip`
 /// draws the last cell as an arrow, for a bar that is still growing.
@@ -125,11 +61,11 @@ fn textured(len: usize, ramp: &Ramp, t0: f64, t1: f64, tip: bool) -> Vec<Span<'s
 
 /// A meter anchored at zero: `filled` of `width`, colour ramped along the
 /// meter's own length, so a fuller meter is a hotter meter.
-fn meter_spans(filled: usize, width: usize, ramp: &Ramp) -> Vec<Span<'static>> {
+fn meter_spans(filled: usize, width: usize, ramp: &Ramp, theme: &Theme) -> Vec<Span<'static>> {
     let filled = filled.min(width);
     let mut spans = textured(filled, ramp, 0.0, filled as f64 / width as f64, false);
     if filled < width {
-        spans.push(Span::styled(METER_TRACK.repeat(width - filled), Style::default().fg(term_color(TRACK_RGB))));
+        spans.push(Span::styled(METER_TRACK.repeat(width - filled), Style::default().fg(theme.track)));
     }
     spans
 }
@@ -147,20 +83,20 @@ fn heat(ms: u64) -> f64 {
 }
 
 /// A labelled host meter: `cpu  25.1%  (12 cores) ▉▉▉▉▏▏▏▏▏`.
-fn meter_line(label: String, ratio: f64, width: usize) -> Line<'static> {
+fn meter_line(label: String, ratio: f64, width: usize, theme: &Theme) -> Line<'static> {
     let label_w = label.chars().count();
     let bar_w = width.saturating_sub(label_w + 1);
-    let mut spans = vec![Span::styled(label, Style::default().fg(Color::White)), Span::raw(" ")];
+    let mut spans = vec![Span::styled(label, Style::default().fg(theme.text)), Span::raw(" ")];
     if bar_w >= 4 {
-        spans.extend(meter_spans((ratio.clamp(0.0, 1.0) * bar_w as f64).round() as usize, bar_w, &RAMP_LOAD));
+        spans.extend(meter_spans((ratio.clamp(0.0, 1.0) * bar_w as f64).round() as usize, bar_w, &theme.ramp_load, theme));
     }
     Line::from(spans)
 }
 
-fn block(title: &str) -> Block<'_> {
-    Block::bordered().border_type(BorderType::Rounded).border_style(Style::default().fg(term_color(BORDER_RGB))).title(Line::from(vec![
+fn block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
+    Block::bordered().border_type(BorderType::Rounded).border_style(Style::default().fg(theme.border)).title(Line::from(vec![
         Span::raw(" "),
-        Span::styled(title, Style::default().fg(ACCENT).bold()),
+        Span::styled(title, Style::default().fg(theme.accent).bold()),
         Span::raw(" "),
     ]))
 }
@@ -168,9 +104,9 @@ fn block(title: &str) -> Block<'_> {
 /// One row of the totals block: a fixed-width label, a fixed-width headline
 /// number, then the detail that qualifies it. The fixed columns are what make
 /// the four rows read as a table rather than as ragged sentences.
-fn stat_line(label: &str, value: String, value_style: Style, rest: Vec<Span<'static>>) -> Line<'static> {
+fn stat_line(label: &str, value: String, value_style: Style, rest: Vec<Span<'static>>, theme: &Theme) -> Line<'static> {
     let mut spans = vec![
-        Span::styled(format!("{label:<STAT_LABEL_W$}"), Style::default().fg(DIM)),
+        Span::styled(format!("{label:<STAT_LABEL_W$}"), Style::default().fg(theme.dim)),
         // Right-aligned: the numbers line up on their units, which is the
         // whole point of giving them a column of their own.
         Span::styled(format!("{value:>STAT_VALUE_W$}"), value_style),
@@ -180,21 +116,24 @@ fn stat_line(label: &str, value: String, value_style: Style, rest: Vec<Span<'sta
     Line::from(spans)
 }
 
-fn dim(text: impl Into<String>) -> Span<'static> {
-    Span::styled(text.into(), Style::default().fg(DIM))
+fn dim(text: impl Into<String>, theme: &Theme) -> Span<'static> {
+    Span::styled(text.into(), Style::default().fg(theme.dim))
 }
 
-pub fn draw(f: &mut Frame, app: &mut App) {
+pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     let area = f.area();
+    // Set both defaults explicitly: raw text must not inherit a terminal
+    // foreground that belongs to a different palette.
+    f.render_widget(Block::default().style(theme.style()), area);
     // A pinned panel takes the table's and the detail pane's place; the header
     // and footer stay, so a dedicated pane is still recognisably agent-top and
     // still shows the burn rate.
     if let Some(p) = app.pinned {
         let [header, body, footer] = Layout::vertical([Constraint::Length(6), Constraint::Min(4), Constraint::Length(1)]).areas(area);
-        draw_header(f, app, header);
-        draw_pinned(f, body, app, p);
-        draw_footer(f, app, footer);
-        draw_overlay(f, area, app);
+        draw_header(f, app, header, theme);
+        draw_pinned(f, body, app, p, theme);
+        draw_footer(f, app, footer, theme);
+        draw_overlay(f, area, app, theme);
         return;
     }
     // With the detail pane open, the agents table takes only the height its
@@ -209,20 +148,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         (Constraint::Min(4), Constraint::Length(0))
     };
     let [header, table, detail, footer] = Layout::vertical([Constraint::Length(6), table_c, detail_c, Constraint::Length(1)]).areas(area);
-    draw_header(f, app, header);
-    draw_table(f, app, table);
+    draw_header(f, app, header, theme);
+    draw_table(f, app, table, theme);
     if app.show_detail {
-        draw_detail(f, app, detail);
+        draw_detail(f, app, detail, theme);
     }
-    draw_footer(f, app, footer);
-    draw_overlay(f, area, app);
+    draw_footer(f, app, footer, theme);
+    draw_overlay(f, area, app, theme);
 }
 
-fn draw_overlay(f: &mut Frame, area: Rect, app: &App) {
+fn draw_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     match app.overlay {
-        Overlay::Help => draw_help(f, area),
-        Overlay::Panel(p) => draw_peek(f, area, app, p),
-        Overlay::Update => draw_update(f, area, app),
+        Overlay::Help => draw_help(f, area, theme),
+        Overlay::Panel(p) => draw_peek(f, area, app, p, theme),
+        Overlay::Update => draw_update(f, area, app, theme),
         Overlay::None => {}
     }
 }
@@ -232,9 +171,6 @@ fn draw_overlay(f: &mut Frame, area: Rect, app: &App) {
 // A panel's content is built once, as lines, and drawn either as a peek (a
 // centred popup, rows capped to the popup) or pinned (the whole terminal, every
 // row, scrollable). The key hints differ; the content does not.
-
-/// The MCP panel's colour, the same magenta the detail pane uses for servers.
-const MCP: Color = Color::Magenta;
 
 /// One panel's lines and the colour of its frame.
 struct PanelBody {
@@ -246,19 +182,19 @@ struct PanelBody {
 
 /// Build a panel's content. `cap` limits rows to what a popup can show, with
 /// an "… n more" line; `None` shows everything. `width` is the room for text.
-fn panel_body(p: Panel, snap: &agent_top_core::Snapshot, cap: Option<usize>, width: usize) -> PanelBody {
+fn panel_body(p: Panel, snap: &agent_top_core::Snapshot, cap: Option<usize>, width: usize, theme: &Theme) -> PanelBody {
     match p {
-        Panel::SlowTools => PanelBody { accent: Color::Rgb(220, 160, 40), width: 66, lines: tool_lines(snap, ToolPanel::Slow, cap) },
-        Panel::FailedTools => PanelBody { accent: Color::Red, width: 66, lines: tool_lines(snap, ToolPanel::Failed, cap) },
-        Panel::Advice => PanelBody { accent: ADVICE, width: 84, lines: advice_lines(snap, width) },
-        Panel::Mcp => PanelBody { accent: MCP, width: 92, lines: mcp_lines(snap, cap, width) },
+        Panel::SlowTools => PanelBody { accent: theme.peach, width: 66, lines: tool_lines(snap, ToolPanel::Slow, cap, theme) },
+        Panel::FailedTools => PanelBody { accent: theme.red, width: 66, lines: tool_lines(snap, ToolPanel::Failed, cap, theme) },
+        Panel::Advice => PanelBody { accent: theme.advice, width: 84, lines: advice_lines(snap, width, theme) },
+        Panel::Mcp => PanelBody { accent: theme.mauve, width: 92, lines: mcp_lines(snap, cap, width, theme) },
     }
 }
 
 /// The frame every panel is drawn in: its title in its colour, and the command
 /// that starts agent-top on it alone, so the standalone form is learnt by
 /// seeing it.
-fn panel_block(p: Panel, snap: &agent_top_core::Snapshot, accent: Color) -> Block<'static> {
+fn panel_block(p: Panel, snap: &agent_top_core::Snapshot, accent: Color, theme: &Theme) -> Block<'static> {
     let title = match p {
         Panel::Advice if !snap.advice.is_empty() => format!(" advice ({}) ", snap.advice.len()),
         _ => format!(" {} ", p.title()),
@@ -268,57 +204,57 @@ fn panel_block(p: Panel, snap: &agent_top_core::Snapshot, accent: Color) -> Bloc
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(accent))
         .title(Span::styled(title, Style::default().fg(accent).bold()))
-        .title_bottom(Line::from(Span::styled(format!(" agent-top {} ", p.command()), Style::default().fg(DIM))).right_aligned())
+        .title_bottom(Line::from(Span::styled(format!(" agent-top {} ", p.command()), Style::default().fg(theme.dim))).right_aligned())
 }
 
 /// A panel as a centred popup over whatever is underneath, with the ways on
 /// from here on its last lines: Enter to fill the terminal, `o` to open it in
 /// a pane when there is a multiplexer to ask, and the panel's key or Esc to
 /// close. The `o` line shows the command that would run, before it runs.
-fn draw_peek(f: &mut Frame, area: Rect, app: &App, p: Panel) {
+fn draw_peek(f: &mut Frame, area: Rect, app: &App, p: Panel, theme: &Theme) {
     let snap = &app.snapshot;
     // Rows are capped to what fits a popup of the usual height; the pinned
     // form has no cap.
     let cap = (area.height.saturating_sub(12) as usize).clamp(4, 20);
-    let probe = panel_body(p, snap, Some(cap), 80);
+    let probe = panel_body(p, snap, Some(cap), 80, theme);
     let w = probe.width.min(area.width.saturating_sub(2));
     let inner = w.saturating_sub(4) as usize;
-    let body = panel_body(p, snap, Some(cap), inner);
+    let body = panel_body(p, snap, Some(cap), inner, theme);
     let mut lines = body.lines;
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::styled("  Enter", Style::default().fg(body.accent).bold()),
-        Span::styled(format!(" full screen · {} or Esc to close", p.key()), Style::default().fg(DIM)),
+        Span::styled(format!(" full screen · {} or Esc to close", p.key()), Style::default().fg(theme.dim)),
     ]));
     if let Some(mux) = app.multiplexer {
         lines.push(Line::from(vec![
             Span::styled("  o", Style::default().fg(body.accent).bold()),
-            Span::styled(format!(" open in a {} pane:  ", mux.label()), Style::default().fg(DIM)),
-            Span::styled(truncate(&mux.describe(p.command()), inner.saturating_sub(28)), Style::default().fg(ACCENT)),
+            Span::styled(format!(" open in a {} pane:  ", mux.label()), Style::default().fg(theme.dim)),
+            Span::styled(truncate(&mux.describe(p.command()), inner.saturating_sub(28)), Style::default().fg(theme.accent)),
         ]));
     }
     let h = (lines.len() as u16 + 2).clamp(6, area.height.saturating_sub(2));
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(Text::from(lines)).block(panel_block(p, snap, body.accent)), popup);
+    f.render_widget(Paragraph::new(Text::from(lines)).style(theme.style()).block(panel_block(p, snap, body.accent, theme)), popup);
 }
 
 /// A panel filling the terminal between the header and the footer: every row,
 /// scrolled by the movement keys. The scroll offset is clamped here, where the
 /// height is known.
-fn draw_pinned(f: &mut Frame, area: Rect, app: &mut App, p: Panel) {
-    let body = panel_body(p, &app.snapshot, None, area.width.saturating_sub(4) as usize);
+fn draw_pinned(f: &mut Frame, area: Rect, app: &mut App, p: Panel, theme: &Theme) {
+    let body = panel_body(p, &app.snapshot, None, area.width.saturating_sub(4) as usize, theme);
     let visible = area.height.saturating_sub(2) as usize;
     let max = body.lines.len().saturating_sub(visible) as u16;
     app.scroll = app.scroll.min(max);
-    let block = panel_block(p, &app.snapshot, body.accent);
+    let block = panel_block(p, &app.snapshot, body.accent, theme);
     f.render_widget(Paragraph::new(Text::from(body.lines)).block(block).scroll((app.scroll, 0)), area);
 }
 
 /// Every MCP server under every agent on screen, then the orphans. The
 /// per-agent rows in the detail pane show one agent's servers; this is the
 /// machine's.
-fn mcp_lines(snap: &agent_top_core::Snapshot, cap: Option<usize>, width: usize) -> Vec<Line<'static>> {
+fn mcp_lines(snap: &agent_top_core::Snapshot, cap: Option<usize>, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let now = snap.taken_at;
     let cap = cap.unwrap_or(usize::MAX);
     let rows: Vec<(&Agent, &agent_top_core::McpServer)> =
@@ -326,18 +262,18 @@ fn mcp_lines(snap: &agent_top_core::Snapshot, cap: Option<usize>, width: usize) 
     let agents_with = snap.agents.iter().filter(|a| !a.mcp_servers.is_empty()).count();
     let mut lines: Vec<Line> = Vec::new();
     if rows.is_empty() {
-        lines.push(Line::styled("  no MCP servers under any agent on screen", Style::default().fg(DIM)));
+        lines.push(Line::styled("  no MCP servers under any agent on screen", Style::default().fg(theme.dim)));
     } else {
         lines.push(Line::styled(
             format!("  {} servers under {agents_with} agents · calls from the transcript; pid? = process guessed", rows.len()),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         ));
         lines.push(Line::styled(
             format!(
                 "  {:<14} {:<14} {:>6} {:>5} {:>3} {:>9} {:>5} {:>6}",
                 "agent", "server", "pid", "calls", "err", "last call", "cpu", "rss"
             ),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         ));
         for (a, m) in rows.iter().take(cap) {
             let (pid, cpu, rss) = match m.pid {
@@ -349,38 +285,38 @@ fn mcp_lines(snap: &agent_top_core::Snapshot, cap: Option<usize>, width: usize) 
                 Some(t) => format!("{} ago", age(now.duration_since(t).unwrap_or_default().as_secs())),
                 None => "-".into(),
             };
-            let err_style = if m.errors > 0 { Style::default().fg(Color::Red) } else { Style::default().fg(DIM) };
+            let err_style = if m.errors > 0 { Style::default().fg(theme.red) } else { Style::default().fg(theme.dim) };
             lines.push(Line::from(vec![
                 Span::raw(format!("  {:<14} ", truncate(&a.name, 14))),
-                Span::styled(format!("{:<14} ", truncate(&m.name, 14)), Style::default().fg(MCP)),
-                Span::styled(format!("{pid:>6} "), Style::default().fg(DIM)),
+                Span::styled(format!("{:<14} ", truncate(&m.name, 14)), Style::default().fg(theme.mauve)),
+                Span::styled(format!("{pid:>6} "), Style::default().fg(theme.dim)),
                 Span::raw(format!("{:>5} ", m.calls)),
                 Span::styled(format!("{:>3} ", m.errors), err_style),
-                Span::styled(format!("{last:>9} {cpu:>5} {rss:>6}"), Style::default().fg(DIM)),
+                Span::styled(format!("{last:>9} {cpu:>5} {rss:>6}"), Style::default().fg(theme.dim)),
             ]));
         }
         if rows.len() > cap {
-            lines.push(Line::styled(format!("  … {} more", rows.len() - cap), Style::default().fg(DIM)));
+            lines.push(Line::styled(format!("  … {} more", rows.len() - cap), Style::default().fg(theme.dim)));
         }
     }
     if !snap.orphans.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("  orphaned mcp processes", Style::default().fg(Color::Red).bold()),
-            Span::styled("  (no live agent ancestor; likely leaked)", Style::default().fg(DIM)),
+            Span::styled("  orphaned mcp processes", Style::default().fg(theme.red).bold()),
+            Span::styled("  (no live agent ancestor; likely leaked)", Style::default().fg(theme.dim)),
         ]));
         for o in snap.orphans.iter().take(cap) {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:>6} ", o.pid), Style::default().fg(Color::Red)),
-                Span::styled(format!("{:>6} {:>6}  ", bytes(o.rss_bytes), age(o.age_secs)), Style::default().fg(DIM)),
+                Span::styled(format!("  {:>6} ", o.pid), Style::default().fg(theme.red)),
+                Span::styled(format!("{:>6} {:>6}  ", bytes(o.rss_bytes), age(o.age_secs)), Style::default().fg(theme.dim)),
                 Span::raw(short_cmd(o, width.saturating_sub(24))),
             ]));
             if let Some(origin) = snap.orphan_origins.iter().find(|x| x.pid == o.pid) {
-                lines.push(Line::styled(format!("         {}", orphan_origin(origin, now)), Style::default().fg(DIM)));
+                lines.push(Line::styled(format!("         {}", orphan_origin(origin, now)), Style::default().fg(theme.dim)));
             }
         }
         if snap.orphans.len() > cap {
-            lines.push(Line::styled(format!("  … {} more", snap.orphans.len() - cap), Style::default().fg(DIM)));
+            lines.push(Line::styled(format!("  … {} more", snap.orphans.len() - cap), Style::default().fg(theme.dim)));
         }
     }
     lines
@@ -390,8 +326,8 @@ fn mcp_lines(snap: &agent_top_core::Snapshot, cap: Option<usize>, width: usize) 
 /// command `u` would run, so nothing happens that was not shown first. When
 /// the binary was not installed by an installer agent-top knows, it shows
 /// the ways to upgrade by hand instead of offering to guess.
-fn draw_update(f: &mut Frame, area: Rect, app: &App) {
-    let amber = Color::Rgb(220, 160, 40);
+fn draw_update(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let amber = theme.peach;
     let latest = app.latest().unwrap_or_default();
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
@@ -404,30 +340,30 @@ fn draw_update(f: &mut Frame, area: Rect, app: &App) {
     match app.installer.command_line() {
         Some(cmd) => {
             lines.push(Line::from(vec![
-                Span::styled("  u ", Style::default().fg(Color::Black).bg(amber)),
+                Span::styled("  u ", theme.badge_style(amber)),
                 Span::raw("  upgrade now, in this terminal:  "),
-                Span::styled(cmd, Style::default().fg(ACCENT)),
+                Span::styled(cmd, Style::default().fg(theme.accent)),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("  n ", Style::default().fg(Color::Black).bg(ACCENT)),
+                Span::styled("  n ", theme.badge_style(theme.accent)),
                 Span::raw("  not now: this version is not asked about again; the footer badge stays"),
             ]));
         }
         None => {
             lines.push(Line::raw("  This binary was not installed by Homebrew or cargo, so agent-top will not"));
             lines.push(Line::raw("  guess how to replace it. Upgrade with one of:"));
-            lines.push(Line::styled("    brew update && brew upgrade agent-top", Style::default().fg(ACCENT)));
-            lines.push(Line::styled("    cargo install agent-top", Style::default().fg(ACCENT)));
-            lines.push(Line::styled("    https://github.com/kannandreams/agent-top/releases/latest", Style::default().fg(ACCENT)));
+            lines.push(Line::styled("    brew update && brew upgrade agent-top", Style::default().fg(theme.accent)));
+            lines.push(Line::styled("    cargo install agent-top", Style::default().fg(theme.accent)));
+            lines.push(Line::styled("    https://github.com/kannandreams/agent-top/releases/latest", Style::default().fg(theme.accent)));
             lines.push(Line::from(vec![
-                Span::styled("  n ", Style::default().fg(Color::Black).bg(ACCENT)),
+                Span::styled("  n ", theme.badge_style(theme.accent)),
                 Span::raw("  not now: this version is not asked about again"),
             ]));
         }
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(format!("  what's new: agent-top --whats-new · {}", crate::CHANGELOG_URL), Style::default().fg(DIM)));
-    lines.push(Line::styled("  AGENT_TOP_NO_UPDATE_CHECK=1 turns the check off", Style::default().fg(DIM)));
+    lines.push(Line::styled(format!("  what's new: agent-top --whats-new · {}", crate::CHANGELOG_URL), Style::default().fg(theme.dim)));
+    lines.push(Line::styled("  AGENT_TOP_NO_UPDATE_CHECK=1 turns the check off", Style::default().fg(theme.dim)));
     let w = 92.min(area.width.saturating_sub(2));
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
@@ -437,21 +373,20 @@ fn draw_update(f: &mut Frame, area: Rect, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(amber))
         .title(Span::styled(" update available ", Style::default().fg(amber).bold()));
-    f.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
+    f.render_widget(Paragraph::new(Text::from(lines)).style(theme.style()).block(block), popup);
 }
-
-/// The advice panel's colour: violet, so it is neither the amber of time
-/// nor the red of failure. Advice is a suggestion, not an alarm.
-const ADVICE: Color = Color::Rgb(190, 140, 255);
 
 /// Every piece of advice on the snapshot: one headline with its numbers, and
 /// under it, dimmed, what could be done. The rules and their thresholds live
 /// in `agent_top_core::advice`.
-fn advice_lines(snap: &agent_top_core::Snapshot, inner: usize) -> Vec<Line<'static>> {
+fn advice_lines(snap: &agent_top_core::Snapshot, inner: usize, theme: &Theme) -> Vec<Line<'static>> {
     let advice = &snap.advice;
     let mut lines: Vec<Line> = Vec::new();
     if advice.is_empty() {
-        lines.push(Line::styled("  nothing to suggest: no oversized results, idle servers or growing servers", Style::default().fg(DIM)));
+        lines.push(Line::styled(
+            "  nothing to suggest: no oversized results, idle servers or growing servers",
+            Style::default().fg(theme.dim),
+        ));
     } else {
         let mut last_agent = "";
         for x in advice {
@@ -460,27 +395,27 @@ fn advice_lines(snap: &agent_top_core::Snapshot, inner: usize) -> Vec<Line<'stat
                     lines.push(Line::raw(""));
                 }
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {}", x.agent_name), Style::default().fg(ACCENT).bold()),
-                    Span::styled(format!("  {}", x.agent_id), Style::default().fg(DIM)),
+                    Span::styled(format!("  {}", x.agent_name), Style::default().fg(theme.accent).bold()),
+                    Span::styled(format!("  {}", x.agent_id), Style::default().fg(theme.dim)),
                 ]));
                 last_agent = &x.agent_name;
             }
             let (mark, colour) = match x.rule {
-                agent_top_core::AdviceRule::ExpensiveSource => ("$", Color::Rgb(220, 160, 40)),
-                agent_top_core::AdviceRule::GrowingMcpServer => ("↑", Color::Red),
-                agent_top_core::AdviceRule::IdleMcpServer => ("·", DIM),
+                agent_top_core::AdviceRule::ExpensiveSource => ("$", theme.peach),
+                agent_top_core::AdviceRule::GrowingMcpServer => ("↑", theme.red),
+                agent_top_core::AdviceRule::IdleMcpServer => ("·", theme.dim),
             };
             for (i, part) in wrap(&x.headline, inner.saturating_sub(4)).into_iter().enumerate() {
                 let lead = if i == 0 { format!("  {mark} ") } else { "    ".to_string() };
                 lines.push(Line::from(vec![Span::styled(lead, Style::default().fg(colour).bold()), Span::raw(part)]));
             }
             for part in wrap(&x.action, inner.saturating_sub(6)) {
-                lines.push(Line::styled(format!("      {part}"), Style::default().fg(DIM)));
+                lines.push(Line::styled(format!("      {part}"), Style::default().fg(theme.dim)));
             }
         }
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled("  read from the numbers on screen; nothing is done for you", Style::default().fg(DIM)));
+    lines.push(Line::styled("  read from the numbers on screen; nothing is done for you", Style::default().fg(theme.dim)));
     lines
 }
 
@@ -552,7 +487,7 @@ fn tool_stats(snap: &agent_top_core::Snapshot) -> Vec<ToolStat> {
 /// The slow-tools or failed-tools leaderboard, from the tool spans already on
 /// screen. Amber for time, red for failures, so the panel is recognisable at
 /// a glance.
-fn tool_lines(snap: &agent_top_core::Snapshot, panel: ToolPanel, cap: Option<usize>) -> Vec<Line<'static>> {
+fn tool_lines(snap: &agent_top_core::Snapshot, panel: ToolPanel, cap: Option<usize>, theme: &Theme) -> Vec<Line<'static>> {
     let mut stats = tool_stats(snap);
     match panel {
         ToolPanel::Slow => stats.sort_by(|a, b| b.total_ms.cmp(&a.total_ms).then(b.max_ms.cmp(&a.max_ms))),
@@ -568,13 +503,13 @@ fn tool_lines(snap: &agent_top_core::Snapshot, panel: ToolPanel, cap: Option<usi
             ToolPanel::Slow => "no tool calls on screen yet",
             ToolPanel::Failed => "no failed tool calls on screen — all green",
         };
-        lines.push(Line::styled(format!("  {msg}"), Style::default().fg(DIM)));
+        lines.push(Line::styled(format!("  {msg}"), Style::default().fg(theme.dim)));
     } else {
         let header = match panel {
             ToolPanel::Slow => format!("  {:<22}{:>7}{:>9}{:>9}{:>7}", "tool", "calls", "total", "avg", "max"),
             ToolPanel::Failed => format!("  {:<22}{:>8}{:>8}{:>9}", "tool", "fails", "calls", "fail%"),
         };
-        lines.push(Line::styled(header, Style::default().fg(DIM)));
+        lines.push(Line::styled(header, Style::default().fg(theme.dim)));
         let cap = cap.unwrap_or(usize::MAX);
         for s in stats.iter().take(cap) {
             let line = match panel {
@@ -597,30 +532,30 @@ fn tool_lines(snap: &agent_top_core::Snapshot, panel: ToolPanel, cap: Option<usi
             lines.push(Line::raw(line));
         }
         if stats.len() > cap {
-            lines.push(Line::styled(format!("  … {} more", stats.len() - cap), Style::default().fg(DIM)));
+            lines.push(Line::styled(format!("  … {} more", stats.len() - cap), Style::default().fg(theme.dim)));
         }
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled("  aggregated from the tool trace on screen", Style::default().fg(DIM)));
+    lines.push(Line::styled("  aggregated from the tool trace on screen", Style::default().fg(theme.dim)));
     lines
 }
 
 /// The spend velocity, coloured by how fast: dim near zero, then amber and red
 /// as the dollars-per-hour climbs. It reads the rate the header already keeps.
-fn burn_span(per_hour: f64) -> Span<'static> {
+fn burn_span(per_hour: f64, theme: &Theme) -> Span<'static> {
     let colour = if per_hour >= 20.0 {
-        Color::Red
+        theme.red
     } else if per_hour >= 5.0 {
-        Color::Rgb(220, 160, 40)
+        theme.peach
     } else if per_hour >= 0.005 {
-        Color::Green
+        theme.green
     } else {
-        DIM
+        theme.dim
     };
     Span::styled(format!("${per_hour:.2}/h"), Style::default().fg(colour))
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
+fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let snap = &app.snapshot;
     let host = &snap.host;
     // The version lives in the footer now, next to quit; the header just names
@@ -630,7 +565,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         host.hostname.as_deref().map(|h| format!(" @ {h}")).unwrap_or_default(),
         if app.paused { "  [PAUSED]" } else { "" }
     );
-    let outer = block(&title);
+    let outer = block(&title, theme);
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
@@ -641,19 +576,20 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let cpu = host.cpu_percent as f64;
     // Leave a gutter so the meter never runs into the totals column.
     let w = (cpu_row.width as usize).saturating_sub(3);
-    f.render_widget(Paragraph::new(meter_line(format!("cpu {cpu:>5.1}% ({:>2} cores)", host.cpu_count), cpu / 100.0, w)), cpu_row);
+    f.render_widget(Paragraph::new(meter_line(format!("cpu {cpu:>5.1}% ({:>2} cores)", host.cpu_count), cpu / 100.0, w, theme)), cpu_row);
     let mem_pct = if host.mem_total_bytes > 0 { host.mem_used_bytes as f64 * 100.0 / host.mem_total_bytes as f64 } else { 0.0 };
     f.render_widget(
         Paragraph::new(meter_line(
             format!("mem {:>5.1}% {:>5}/{:>5}", mem_pct, bytes(host.mem_used_bytes), bytes(host.mem_total_bytes)),
             mem_pct / 100.0,
             w,
+            theme,
         )),
         mem_row,
     );
     let [spark_label, spark] = Layout::horizontal([Constraint::Length(11), Constraint::Min(4)]).areas(spark_row);
-    f.render_widget(Paragraph::new(Span::styled("out tok/s ", Style::default().fg(DIM))), spark_label);
-    f.render_widget(Sparkline::default().data(&app.output_rate).style(Style::default().fg(ACCENT)), spark);
+    f.render_widget(Paragraph::new(Span::styled("out tok/s ", Style::default().fg(theme.dim))), spark_label);
+    f.render_widget(Sparkline::default().data(&app.output_rate).style(Style::default().fg(theme.accent)), spark);
 
     let t = &snap.totals;
     let lines = vec![
@@ -662,41 +598,44 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             t.agents.to_string(),
             Style::default().bold(),
             vec![
-                Span::styled(format!("{:>2} running", t.running), Style::default().fg(Color::Green)),
-                dim("   "),
-                Span::styled(format!("{:>2} idle", t.idle), Style::default().fg(Color::Yellow)),
-                dim("   "),
-                Span::styled(format!("{:>2} stopped", t.stopped), Style::default().fg(DIM)),
+                Span::styled(format!("{:>2} running", t.running), Style::default().fg(theme.green)),
+                dim("   ", theme),
+                Span::styled(format!("{:>2} idle", t.idle), Style::default().fg(theme.yellow)),
+                dim("   ", theme),
+                Span::styled(format!("{:>2} stopped", t.stopped), Style::default().fg(theme.dim)),
             ],
+            theme,
         ),
         stat_line(
             "tokens",
             tokens(t.tokens),
             Style::default().bold(),
             vec![
-                dim("total cost "),
+                dim("total cost ", theme),
                 Span::styled(
                     format!("${:.2}{}", t.cost_usd, if t.unpriced_tokens > 0 { "+" } else { "" }),
-                    Style::default().fg(Color::Magenta).bold(),
+                    Style::default().fg(theme.mauve).bold(),
                 ),
-                dim("   burn "),
-                burn_span(app.burn_per_hour),
+                dim("   burn ", theme),
+                burn_span(app.burn_per_hour, theme),
             ],
+            theme,
         ),
         stat_line(
             "procs",
             t.processes.to_string(),
             Style::default(),
             vec![
-                dim("mcp "),
+                dim("mcp ", theme),
                 Span::raw(format!("{:<4}", t.mcp_processes)),
-                dim("orphaned "),
+                dim("orphaned ", theme),
                 if t.orphaned_mcp > 0 {
-                    Span::styled(t.orphaned_mcp.to_string(), Style::default().fg(Color::Red).bold())
+                    Span::styled(t.orphaned_mcp.to_string(), Style::default().fg(theme.red).bold())
                 } else {
                     Span::raw("0")
                 },
             ],
+            theme,
         ),
         // What the agents themselves are costing the machine, as opposed to
         // the whole-host meters on the left.
@@ -704,32 +643,33 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             "agent use",
             format!("{:.1}%", t.cpu_percent),
             Style::default(),
-            vec![dim("cpu · "), Span::raw(bytes(t.rss_bytes)), dim(" resident")],
+            vec![dim("cpu · ", theme), Span::raw(bytes(t.rss_bytes)), dim(" resident", theme)],
+            theme,
         ),
     ];
     f.render_widget(Paragraph::new(Text::from(lines)), right);
 }
 
-fn draw_table(f: &mut Frame, app: &App, area: Rect) {
+fn draw_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let header = Row::new(
         ["AGENT", "HARNESS", "STATE", "PID", "MODEL", "TOKENS", "COST", "CPU%", "MEM", "TOOLS", "PROCS", "MCP", "AGE"]
             .into_iter()
-            .map(|h| Cell::from(h).style(Style::default().fg(ACCENT).bold())),
+            .map(|h| Cell::from(h).style(Style::default().fg(theme.accent).bold())),
     )
     .bottom_margin(0);
 
     let rows = app.rows.iter().map(|a| {
         let mem = mem_cell(a);
         let cpu = cpu_cell(a);
-        let mcp_style = if a.mcp_count > 0 { Style::default().fg(Color::Magenta) } else { Style::default() };
+        let mcp_style = if a.mcp_count > 0 { Style::default().fg(theme.mauve) } else { Style::default() };
         Row::new(vec![
             Cell::from(truncate(&a.name, 26)).style(Style::default().bold()),
             Cell::from(a.harness.label()),
-            Cell::from(a.state.label()).style(state_style(a.state)),
+            Cell::from(a.state.label()).style(state_style(a.state, theme)),
             Cell::from(a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
             Cell::from(short_model(a.model.as_deref())),
             Cell::from(tokens_cell(a)),
-            Cell::from(cost(a)).style(Style::default().fg(Color::Magenta)),
+            Cell::from(cost(a)).style(Style::default().fg(theme.mauve)),
             Cell::from(cpu),
             Cell::from(mem),
             Cell::from(a.tool_calls.to_string()),
@@ -743,7 +683,7 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
             Cell::from(a.mcp_count.to_string()).style(mcp_style),
             Cell::from(age(a.age_secs)),
         ])
-        .style(if a.state == AgentState::Stopped { Style::default().fg(DIM) } else { Style::default() })
+        .style(if a.state == AgentState::Stopped { Style::default().fg(theme.dim) } else { Style::default() })
     });
 
     let widths = [
@@ -764,19 +704,19 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     let title = format!("agents ({})", app.rows.len());
     let table = Table::new(rows, widths)
         .header(header)
-        .block(block(&title))
+        .block(block(&title, theme))
         .column_spacing(1)
-        .row_highlight_style(Style::default().bg(Color::Rgb(40, 50, 70)).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(theme.selection).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     let mut state = TableState::default().with_selected(if app.rows.is_empty() { None } else { Some(app.selected) });
     f.render_stateful_widget(table, area, &mut state);
 
     if app.rows.is_empty() {
         let msg = Paragraph::new(Line::from(vec![
-            Span::styled("no coding agents found. ", Style::default().fg(DIM)),
+            Span::styled("no coding agents found. ", Style::default().fg(theme.dim)),
             Span::styled(
                 "start claude, codex or gemini in another terminal, or run agent-top --json to debug discovery.",
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim),
             ),
         ]))
         .wrap(Wrap { trim: true });
@@ -785,42 +725,42 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
+fn draw_detail(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let Some(a) = app.selected_agent() else {
-        f.render_widget(block("detail"), area);
+        f.render_widget(block("detail", theme), area);
         return;
     };
     let title = format!("{} · {} · {}  [{}]", a.name, a.harness.label(), a.state.label(), app.detail.label());
-    let outer = block(&title);
+    let outer = block(&title, theme);
     let inner = outer.inner(area);
     f.render_widget(outer, area);
     let [left, right] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(inner);
-    f.render_widget(Paragraph::new(agent_facts(a, app.snapshot.taken_at)).wrap(Wrap { trim: false }), left);
+    f.render_widget(Paragraph::new(agent_facts(a, app.snapshot.taken_at, theme)).wrap(Wrap { trim: false }), left);
     let panel = match app.detail {
         DetailView::Tree => {
-            process_tree(a, &app.snapshot.orphans, &app.snapshot.orphan_origins, app.snapshot.taken_at, right.width as usize)
+            process_tree(a, &app.snapshot.orphans, &app.snapshot.orphan_origins, app.snapshot.taken_at, right.width as usize, theme)
         }
-        DetailView::Trace => tool_trace(a, app.snapshot.taken_at, right.width as usize, right.height as usize),
+        DetailView::Trace => tool_trace(a, app.snapshot.taken_at, right.width as usize, right.height as usize, theme),
     };
     f.render_widget(Paragraph::new(panel), right);
 }
 
-fn kv<'a>(k: &'a str, v: String) -> Line<'a> {
-    Line::from(vec![Span::styled(format!("{k:<11}"), Style::default().fg(DIM)), Span::raw(v)])
+fn kv<'a>(k: &'a str, v: String, theme: &Theme) -> Line<'a> {
+    Line::from(vec![Span::styled(format!("{k:<11}"), Style::default().fg(theme.dim)), Span::raw(v)])
 }
 
 /// One line of the cost breakdown: tokens, the price they were charged at,
 /// and what that came to. The price column is the row's current model's; the
 /// cost column is exact even when the session changed model part way.
-fn cost_row(label: &str, n: u64, per_m: Option<f64>, usd: f64) -> Line<'static> {
+fn cost_row(label: &str, n: u64, per_m: Option<f64>, usd: f64, theme: &Theme) -> Line<'static> {
     let (per_m, usd) = match per_m {
         Some(p) => (format!("{p:>9.2}"), format!("{usd:>10.2}")),
         None => (format!("{:>9}", "n/a"), format!("{:>10}", "-")),
     };
     Line::from(vec![
-        Span::styled(format!("{label:<13}"), Style::default().fg(DIM)),
+        Span::styled(format!("{label:<13}"), Style::default().fg(theme.dim)),
         Span::raw(format!("{:>7}", tokens(n))),
-        dim(per_m),
+        dim(per_m, theme),
         Span::raw(usd),
     ])
 }
@@ -849,14 +789,14 @@ pub fn window_label(minutes: u64) -> String {
 
 /// One rate-limit window: how much is used and when it resets, coloured by
 /// how close it is to the limit.
-fn rate_window_line(kind: &str, w: &agent_top_core::RateWindow, now: SystemTime) -> Line<'static> {
+fn rate_window_line(kind: &str, w: &agent_top_core::RateWindow, now: SystemTime, theme: &Theme) -> Line<'static> {
     let pct = w.used_percent;
     let colour = if pct >= 90.0 {
-        Color::Red
+        theme.red
     } else if pct >= 75.0 {
-        Color::Rgb(220, 160, 40)
+        theme.peach
     } else {
-        Color::Green
+        theme.green
     };
     let resets = match w.resets_at {
         Some(t) => match t.duration_since(now) {
@@ -866,39 +806,39 @@ fn rate_window_line(kind: &str, w: &agent_top_core::RateWindow, now: SystemTime)
         None => String::new(),
     };
     Line::from(vec![
-        Span::styled(format!("  {:<9}", window_label(w.window_minutes)), Style::default().fg(DIM)),
+        Span::styled(format!("  {:<9}", window_label(w.window_minutes)), Style::default().fg(theme.dim)),
         Span::styled(format!("{pct:>4.0}% used"), Style::default().fg(colour)),
-        dim(format!("   {kind}")),
-        if resets.is_empty() { Span::raw(String::new()) } else { dim(format!("   {resets}")) },
+        dim(format!("   {kind}"), theme),
+        if resets.is_empty() { Span::raw(String::new()) } else { dim(format!("   {resets}"), theme) },
     ])
 }
 
 /// How much of the prompt is being served from cache, coloured by how good
 /// that is. Blank on a session too small to judge, so it does not cry "0%" on
 /// a two-turn session that never built a cache.
-fn cache_line(a: &Agent) -> Line<'static> {
+fn cache_line(a: &Agent, theme: &Theme) -> Line<'static> {
     // Under a few thousand prompt tokens there is nothing meaningful to say.
     let prompt = a.usage.prompt();
     let Some(rate) = a.usage.cache_hit_rate().filter(|_| prompt >= 5_000) else {
-        return kv("cache", "-".into());
+        return kv("cache", "-".into(), theme);
     };
     let pct = rate * 100.0;
     let colour = if pct >= 70.0 {
-        Color::Green
+        theme.green
     } else if pct >= 40.0 {
-        Color::Rgb(220, 160, 40)
+        theme.peach
     } else {
-        Color::Red
+        theme.red
     };
     let note = if pct < 40.0 { "   full price most turns" } else { "" };
     Line::from(vec![
-        Span::styled(format!("{:<11}", "cache"), Style::default().fg(DIM)),
+        Span::styled(format!("{:<11}", "cache"), Style::default().fg(theme.dim)),
         Span::styled(format!("{pct:.0}% from cache"), Style::default().fg(colour)),
-        dim(note.to_string()),
+        dim(note.to_string(), theme),
     ])
 }
 
-fn agent_facts(a: &Agent, now: SystemTime) -> Text<'static> {
+fn agent_facts(a: &Agent, now: SystemTime, theme: &Theme) -> Text<'static> {
     let u = &a.usage;
     let b = &a.cost_breakdown;
     let price = a.model.as_deref().and_then(agent_top_core::pricing::price_for);
@@ -914,46 +854,50 @@ fn agent_facts(a: &Agent, now: SystemTime) -> Text<'static> {
     let tilde = |p: &std::path::Path| p.to_string_lossy().replacen(&home, "~", 1);
     let mut lines = Vec::new();
     if let Some(w) = &a.parse_warning {
-        lines.push(Line::from(vec![Span::styled(format!("⚠ {w}"), Style::default().fg(Color::Red).bold())]));
+        lines.push(Line::from(vec![Span::styled(format!("⚠ {w}"), Style::default().fg(theme.red).bold())]));
         lines.push(Line::raw(""));
     }
     // Identity first, then the headline numbers a glance wants (cost, cache,
     // turns, tools) high up, so a short detail pane never clips them; the
     // per-token cost breakdown, a dig-deeper detail, comes below them.
     lines.extend(vec![
-        kv("session", a.session_id.clone().unwrap_or_else(|| "-".into())),
-        kv("cwd", a.cwd.as_deref().map(tilde).unwrap_or_else(|| "-".into())),
-        kv("model", a.model.clone().unwrap_or_else(|| "-".into())),
-        kv("version", a.harness_version.clone().unwrap_or_else(|| "-".into())),
-        kv("activity", format!("{:?}{}", a.activity, a.idle_secs.map(|s| format!(", last write {} ago", age(s))).unwrap_or_default())),
-        kv("attributed", attribution.to_string()),
+        kv("session", a.session_id.clone().unwrap_or_else(|| "-".into()), theme),
+        kv("cwd", a.cwd.as_deref().map(tilde).unwrap_or_else(|| "-".into()), theme),
+        kv("model", a.model.clone().unwrap_or_else(|| "-".into()), theme),
+        kv("version", a.harness_version.clone().unwrap_or_else(|| "-".into()), theme),
+        kv(
+            "activity",
+            format!("{:?}{}", a.activity, a.idle_secs.map(|s| format!(", last write {} ago", age(s))).unwrap_or_default()),
+            theme,
+        ),
+        kv("attributed", attribution.to_string(), theme),
         Line::raw(""),
         Line::from(vec![
-            Span::styled(format!("{:<11}", "cost"), Style::default().fg(DIM)),
+            Span::styled(format!("{:<11}", "cost"), Style::default().fg(theme.dim)),
             Span::styled(cost(a), Style::default().bold()),
-            dim(format!("   {}", price_basis(a))),
+            dim(format!("   {}", price_basis(a)), theme),
         ]),
-        cache_line(a),
-        kv("tokens", tokens(u.total())),
-        kv("turns", format!("{} ({} subagent)", a.turns, a.subagent_turns)),
-        kv("tool calls", a.tool_calls.to_string()),
+        cache_line(a, theme),
+        kv("tokens", tokens(u.total()), theme),
+        kv("turns", format!("{} ({} subagent)", a.turns, a.subagent_turns), theme),
+        kv("tool calls", a.tool_calls.to_string(), theme),
     ]);
     if a.web_searches > 0 {
         let priced = if b.web_search > 0.0 { format!(" (${:.2})", b.web_search) } else { " (not priced)".to_string() };
-        lines.push(kv("web search", format!("{}{priced}", a.web_searches)));
+        lines.push(kv("web search", format!("{}{priced}", a.web_searches), theme));
     }
     // The per-token cost breakdown, below the headline stats.
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<13}{:>7}", "breakdown", ""), Style::default().fg(ACCENT).bold()),
-        dim(format!("{:>9}{:>10}", "$/M", "cost")),
+        Span::styled(format!("{:<13}{:>7}", "breakdown", ""), Style::default().fg(theme.accent).bold()),
+        dim(format!("{:>9}{:>10}", "$/M", "cost"), theme),
     ]));
     lines.extend(vec![
-        cost_row("  input", u.input, price.map(|p| p.input), b.input),
-        cost_row("  cache rd", u.cache_read, price.map(|p| p.cache_read), b.cache_read),
-        cost_row("  cache wr 5m", u.cache_write_5m, price.map(|p| p.cache_write_5m), b.cache_write_5m),
-        cost_row("  cache wr 1h", u.cache_write_1h, price.map(|p| p.cache_write_1h), b.cache_write_1h),
-        cost_row("  output", u.output, price.map(|p| p.output), b.output),
+        cost_row("  input", u.input, price.map(|p| p.input), b.input, theme),
+        cost_row("  cache rd", u.cache_read, price.map(|p| p.cache_read), b.cache_read, theme),
+        cost_row("  cache wr 5m", u.cache_write_5m, price.map(|p| p.cache_write_5m), b.cache_write_5m, theme),
+        cost_row("  cache wr 1h", u.cache_write_1h, price.map(|p| p.cache_write_1h), b.cache_write_1h, theme),
+        cost_row("  output", u.output, price.map(|p| p.output), b.output, theme),
     ]);
     if let Some(rl) = &a.rate_limit {
         lines.push(Line::raw(""));
@@ -961,25 +905,25 @@ fn agent_facts(a: &Agent, now: SystemTime) -> Text<'static> {
             Some(plan) => format!("rate limit ({plan})"),
             None => "rate limit".to_string(),
         };
-        let mut spans = vec![Span::styled(format!("{head:<20}"), Style::default().fg(ACCENT).bold())];
+        let mut spans = vec![Span::styled(format!("{head:<20}"), Style::default().fg(theme.accent).bold())];
         if rl.reached {
-            spans.push(Span::styled("LIMIT REACHED", Style::default().fg(Color::Red).bold()));
+            spans.push(Span::styled("LIMIT REACHED", Style::default().fg(theme.red).bold()));
         }
         lines.push(Line::from(spans));
         for (label, w) in [("primary", &rl.primary), ("secondary", &rl.secondary)] {
             if let Some(w) = w {
-                lines.push(rate_window_line(label, w, now));
+                lines.push(rate_window_line(label, w, now, theme));
             }
         }
     }
     if let Some(p) = &a.session_path {
-        lines.push(kv("transcript", tilde(p)));
+        lines.push(kv("transcript", tilde(p), theme));
     }
     if let Some(id) = &a.session_id {
         // The first eight characters are almost always unique on one machine,
         // and are what a user can type. The command resolves a prefix.
         let short: String = id.chars().take(8).collect();
-        lines.push(kv("export", format!("agent-top trace --session {short} -o trace.json")));
+        lines.push(kv("export", format!("agent-top trace --session {short} -o trace.json"), theme));
     }
     Text::from(lines)
 }
@@ -988,18 +932,18 @@ fn agent_facts(a: &Agent, now: SystemTime) -> Text<'static> {
 /// and sized on a shared time axis, so a single long call and a storm of short
 /// ones look different at a glance. Answers "why has this agent been busy for
 /// eight minutes", which the table alone cannot.
-fn tool_trace(a: &Agent, now: SystemTime, width: usize, height: usize) -> Text<'static> {
+fn tool_trace(a: &Agent, now: SystemTime, width: usize, height: usize, theme: &Theme) -> Text<'static> {
     let head = |extra: Vec<Span<'static>>| {
-        let mut spans = vec![Span::styled("tool trace", Style::default().fg(ACCENT).bold())];
+        let mut spans = vec![Span::styled("tool trace", Style::default().fg(theme.accent).bold())];
         spans.extend(extra);
         Line::from(spans)
     };
     if a.spans.is_empty() {
         return Text::from(vec![
-            head(vec![Span::styled(format!("   {} tool calls", a.tool_calls), Style::default().fg(DIM))]),
+            head(vec![Span::styled(format!("   {} tool calls", a.tool_calls), Style::default().fg(theme.dim))]),
             Line::styled(
                 if a.tool_calls > 0 { "  (calls happened before agent-top started reading)" } else { "  (no tool calls yet)" },
-                Style::default().fg(DIM),
+                Style::default().fg(theme.dim),
             ),
         ]);
     }
@@ -1034,11 +978,11 @@ fn tool_trace(a: &Agent, now: SystemTime, width: usize, height: usize) -> Text<'
     let mut lines = vec![
         head(vec![Span::styled(
             format!("   {} of {} calls · window {}", calls, a.tool_calls, duration_ms(window_ms)),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         )]),
-        Line::from(trace_summary(&shown, turn, now, window_ms)),
+        Line::from(trace_summary(&shown, turn, now, window_ms, theme)),
     ];
-    let track = Style::default().fg(term_color(TRACK_RGB));
+    let track = Style::default().fg(theme.track);
     for s in &shown {
         let elapsed = s.elapsed_ms(now);
         let start = cell(s.started_at).min(bar_w.saturating_sub(1));
@@ -1048,28 +992,28 @@ fn tool_trace(a: &Agent, now: SystemTime, width: usize, height: usize) -> Text<'
         // means a slow call and a failed call never compete for one colour.
         let inference = s.kind == SpanKind::Inference;
         let (ramp, mark) = if s.error {
-            (&RAMP_ERROR, "!")
+            (&theme.ramp_error, "!")
         } else if s.is_open() {
-            (&RAMP_OPEN, "…")
+            (&theme.ramp_open, "…")
         } else if inference {
-            (&RAMP_INFERENCE, " ")
+            (&theme.ramp_inference, " ")
         } else if s.sidechain {
-            (&RAMP_SUBAGENT, " ")
+            (&theme.ramp_subagent, " ")
         } else {
-            (&RAMP_OK, " ")
+            (&theme.ramp_ok, " ")
         };
         let name_style = match (s.error, s.is_open(), inference, s.sidechain) {
-            (true, _, _, _) => Style::default().fg(RAMP_ERROR.at(1.0)),
-            (_, true, _, _) => Style::default().fg(RAMP_OPEN.at(0.8)),
-            (_, _, true, _) => Style::default().fg(DIM),
-            (_, _, _, true) => Style::default().fg(RAMP_SUBAGENT.at(0.0)),
-            _ => Style::default().fg(Color::White),
+            (true, _, _, _) => Style::default().fg(theme.ramp_error.at(1.0)),
+            (_, true, _, _) => Style::default().fg(theme.ramp_open.at(0.8)),
+            (_, _, true, _) => Style::default().fg(theme.dim),
+            (_, _, _, true) => Style::default().fg(theme.ramp_subagent.at(0.0)),
+            _ => Style::default().fg(theme.text),
         };
         let label = if inference { "model" } else { s.name.as_str() };
         let name = format!("{}{}", if s.sidechain { "↳" } else { "" }, label);
         let mut row = vec![
             Span::styled(format!("{:<NAME_W$}", truncate(&name, NAME_W)), name_style),
-            Span::styled(format!("{:>DUR_W$}", format!("{}{mark}", duration_ms(elapsed))), Style::default().fg(DIM)),
+            Span::styled(format!("{:>DUR_W$}", format!("{}{mark}", duration_ms(elapsed))), Style::default().fg(theme.dim)),
             Span::raw(" "),
         ];
         // The bar sits in a full-width track, so an empty stretch reads as
@@ -1094,7 +1038,7 @@ fn tool_trace(a: &Agent, now: SystemTime, width: usize, height: usize) -> Text<'
 /// time and model time are measured separately, each with overlaps merged,
 /// so together they say how much of the window was accounted for and how
 /// much was neither (waiting on the human, mostly).
-fn trace_summary(shown: &[&ToolSpan], turn: Option<&ToolSpan>, now: SystemTime, window_ms: u64) -> Vec<Span<'static>> {
+fn trace_summary(shown: &[&ToolSpan], turn: Option<&ToolSpan>, now: SystemTime, window_ms: u64, theme: &Theme) -> Vec<Span<'static>> {
     let tools: Vec<&ToolSpan> = shown.iter().copied().filter(|s| s.kind == SpanKind::Tool).collect();
     let thinking: Vec<&ToolSpan> = shown.iter().copied().filter(|s| s.kind == SpanKind::Inference).collect();
     let slowest = tools.iter().max_by_key(|s| s.elapsed_ms(now));
@@ -1102,29 +1046,29 @@ fn trace_summary(shown: &[&ToolSpan], turn: Option<&ToolSpan>, now: SystemTime, 
     let open = tools.iter().filter(|s| s.is_open()).count();
     let share = busy_ms(&tools, now) * 100 / window_ms;
     let mut spans = vec![
-        Span::styled("  in tools ", Style::default().fg(DIM)),
-        Span::styled(format!("{share}%"), Style::default().fg(RAMP_OK.at(share as f64 / 100.0)).bold()),
+        Span::styled("  in tools ", Style::default().fg(theme.dim)),
+        Span::styled(format!("{share}%"), Style::default().fg(theme.ramp_ok.at(share as f64 / 100.0)).bold()),
     ];
     if !thinking.is_empty() {
         let share = busy_ms(&thinking, now) * 100 / window_ms;
-        spans.push(Span::styled("  model ", Style::default().fg(DIM)));
-        spans.push(Span::styled(format!("{share}%"), Style::default().fg(RAMP_INFERENCE.at(1.0)).bold()));
+        spans.push(Span::styled("  model ", Style::default().fg(theme.dim)));
+        spans.push(Span::styled(format!("{share}%"), Style::default().fg(theme.ramp_inference.at(1.0)).bold()));
     }
     if let Some(t) = turn {
         let mark = if t.is_open() { "…" } else { "" };
-        spans.push(Span::styled(format!("  turn {}{mark}", duration_ms(t.elapsed_ms(now))), Style::default().fg(DIM)));
+        spans.push(Span::styled(format!("  turn {}{mark}", duration_ms(t.elapsed_ms(now))), Style::default().fg(theme.dim)));
     }
     if let Some(s) = slowest {
         spans.push(Span::styled(
             format!("  slowest {} {}", truncate(&s.name, 14), duration_ms(s.elapsed_ms(now))),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         ));
     }
     if open > 0 {
-        spans.push(Span::styled(format!("  {open} in flight"), Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(format!("  {open} in flight"), Style::default().fg(theme.yellow)));
     }
     if errors > 0 {
-        spans.push(Span::styled(format!("  {errors} failed"), Style::default().fg(Color::Red)));
+        spans.push(Span::styled(format!("  {errors} failed"), Style::default().fg(theme.red)));
     }
     spans
 }
@@ -1153,30 +1097,29 @@ fn busy_ms(shown: &[&ToolSpan], now: SystemTime) -> u64 {
     total.as_millis() as u64
 }
 
-fn process_tree(a: &Agent, orphans: &[ProcNode], origins: &[OrphanOrigin], now: SystemTime, width: usize) -> Text<'static> {
+fn process_tree(a: &Agent, orphans: &[ProcNode], origins: &[OrphanOrigin], now: SystemTime, width: usize, theme: &Theme) -> Text<'static> {
     let mut lines = vec![Line::from(vec![
-        Span::styled("process tree", Style::default().fg(ACCENT).bold()),
+        Span::styled("process tree", Style::default().fg(theme.accent).bold()),
         Span::styled(
             format!("   {} procs · {} mcp · cpu {:.1}% · rss {}", a.process_count, a.mcp_count, a.cpu_percent, bytes(a.rss_bytes)),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         ),
     ])];
     match &a.tree {
-        None if a.shares_process => {
-            lines.push(Line::styled("  shares its process with another conversation; see the row that owns it", Style::default().fg(DIM)))
-        }
-        None => lines.push(Line::styled("  (no live process)", Style::default().fg(DIM))),
-        Some(root) => render_node(root, "", true, true, width, &mut lines),
+        None if a.shares_process => lines
+            .push(Line::styled("  shares its process with another conversation; see the row that owns it", Style::default().fg(theme.dim))),
+        None => lines.push(Line::styled("  (no live process)", Style::default().fg(theme.dim))),
+        Some(root) => render_node(root, "", true, true, width, &mut lines, theme),
     }
     if !a.mcp_servers.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("mcp servers", Style::default().fg(Color::Magenta).bold()),
-            Span::styled("   calls from the transcript; pid? = process guessed", Style::default().fg(DIM)),
+            Span::styled("mcp servers", Style::default().fg(theme.mauve).bold()),
+            Span::styled("   calls from the transcript; pid? = process guessed", Style::default().fg(theme.dim)),
         ]));
         lines.push(Line::styled(
             format!("  {:<14} {:>6} {:>5} {:>3} {:>9} {:>5} {:>6}", "server", "pid", "calls", "err", "last call", "cpu", "rss"),
-            Style::default().fg(DIM),
+            Style::default().fg(theme.dim),
         ));
         for m in &a.mcp_servers {
             // A `?` after the pid marks a process paired with the server by
@@ -1191,38 +1134,38 @@ fn process_tree(a: &Agent, orphans: &[ProcNode], origins: &[OrphanOrigin], now: 
                 Some(t) => format!("{} ago", age(now.duration_since(t).unwrap_or_default().as_secs())),
                 None => "-".into(),
             };
-            let err_style = if m.errors > 0 { Style::default().fg(Color::Red) } else { Style::default().fg(DIM) };
+            let err_style = if m.errors > 0 { Style::default().fg(theme.red) } else { Style::default().fg(theme.dim) };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<14} ", truncate(&m.name, 14)), Style::default().fg(Color::Magenta)),
-                Span::styled(format!("{pid:>6} "), Style::default().fg(DIM)),
+                Span::styled(format!("  {:<14} ", truncate(&m.name, 14)), Style::default().fg(theme.mauve)),
+                Span::styled(format!("{pid:>6} "), Style::default().fg(theme.dim)),
                 Span::raw(format!("{:>5} ", m.calls)),
                 Span::styled(format!("{:>3} ", m.errors), err_style),
-                Span::styled(format!("{last:>9} {cpu:>5} {rss:>6}"), Style::default().fg(DIM)),
+                Span::styled(format!("{last:>9} {cpu:>5} {rss:>6}"), Style::default().fg(theme.dim)),
             ]));
         }
     }
     if !a.context.is_empty() {
         lines.push(Line::raw(""));
-        lines.extend(context_by_source(a));
+        lines.extend(context_by_source(a, theme));
     }
     if !orphans.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("orphaned mcp processes", Style::default().fg(Color::Red).bold()),
-            Span::styled("  (no live agent ancestor; likely leaked)", Style::default().fg(DIM)),
+            Span::styled("orphaned mcp processes", Style::default().fg(theme.red).bold()),
+            Span::styled("  (no live agent ancestor; likely leaked)", Style::default().fg(theme.dim)),
         ]));
         for o in orphans.iter().take(8) {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:>6} ", o.pid), Style::default().fg(Color::Red)),
-                Span::styled(format!("{:>6} {:>6}  ", bytes(o.rss_bytes), age(o.age_secs)), Style::default().fg(DIM)),
+                Span::styled(format!("  {:>6} ", o.pid), Style::default().fg(theme.red)),
+                Span::styled(format!("{:>6} {:>6}  ", bytes(o.rss_bytes), age(o.age_secs)), Style::default().fg(theme.dim)),
                 Span::raw(short_cmd(o, width.saturating_sub(24))),
             ]));
             if let Some(origin) = origins.iter().find(|x| x.pid == o.pid) {
-                lines.push(Line::styled(format!("         {}", orphan_origin(origin, now)), Style::default().fg(DIM)));
+                lines.push(Line::styled(format!("         {}", orphan_origin(origin, now)), Style::default().fg(theme.dim)));
             }
         }
         if orphans.len() > 8 {
-            lines.push(Line::styled(format!("  … {} more", orphans.len() - 8), Style::default().fg(DIM)));
+            lines.push(Line::styled(format!("  … {} more", orphans.len() - 8), Style::default().fg(theme.dim)));
         }
     }
     Text::from(lines)
@@ -1236,33 +1179,33 @@ const CONTEXT_ROWS: usize = 6;
 /// system prompt, the user's messages and the model's replies is last in
 /// spirit but sorts with the rest, since on a fresh session it is the
 /// biggest thing there.
-fn context_by_source(a: &Agent) -> Vec<Line<'static>> {
+fn context_by_source(a: &Agent, theme: &Theme) -> Vec<Line<'static>> {
     use agent_top_core::ContextOrigin;
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("context", Style::default().fg(ACCENT).bold()),
-            Span::styled("   tokens each tool added to the prompt, and their cost since", Style::default().fg(DIM)),
+            Span::styled("context", Style::default().fg(theme.accent).bold()),
+            Span::styled("   tokens each tool added to the prompt, and their cost since", Style::default().fg(theme.dim)),
         ]),
-        Line::styled(format!("  {:<18} {:>5} {:>7} {:>8}", "source", "calls", "added", "cost"), Style::default().fg(DIM)),
+        Line::styled(format!("  {:<18} {:>5} {:>7} {:>8}", "source", "calls", "added", "cost"), Style::default().fg(theme.dim)),
     ];
     for c in a.context.iter().take(CONTEXT_ROWS) {
         let (label, style) = match c.origin {
-            ContextOrigin::Mcp => (format!("mcp {}", c.name), Style::default().fg(Color::Magenta)),
-            ContextOrigin::Tool => (c.name.clone(), Style::default().fg(Color::White)),
-            ContextOrigin::Other => ("prompts & replies".to_string(), Style::default().fg(DIM)),
+            ContextOrigin::Mcp => (format!("mcp {}", c.name), Style::default().fg(theme.mauve)),
+            ContextOrigin::Tool => (c.name.clone(), Style::default().fg(theme.text)),
+            ContextOrigin::Other => ("prompts & replies".to_string(), Style::default().fg(theme.dim)),
         };
         let calls = if c.origin == ContextOrigin::Other { "-".to_string() } else { c.calls.to_string() };
         // No price for the model: the tokens are real, the cost is not knowable.
         let cost = if a.price_source.is_none() { "-".to_string() } else { format!("${:.2}", c.cost_usd) };
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<18} ", truncate(&label, 18)), style),
-            Span::styled(format!("{calls:>5} "), Style::default().fg(DIM)),
+            Span::styled(format!("{calls:>5} "), Style::default().fg(theme.dim)),
             Span::raw(format!("{:>7} ", tokens(c.tokens))),
             Span::raw(format!("{cost:>8}")),
         ]));
     }
     if a.context.len() > CONTEXT_ROWS {
-        lines.push(Line::styled(format!("  … {} more", a.context.len() - CONTEXT_ROWS), Style::default().fg(DIM)));
+        lines.push(Line::styled(format!("  … {} more", a.context.len() - CONTEXT_ROWS), Style::default().fg(theme.dim)));
     }
     lines
 }
@@ -1279,7 +1222,7 @@ pub fn orphan_origin(o: &OrphanOrigin, now: SystemTime) -> String {
     }
 }
 
-fn render_node(n: &ProcNode, prefix: &str, last: bool, root: bool, width: usize, out: &mut Vec<Line<'static>>) {
+fn render_node(n: &ProcNode, prefix: &str, last: bool, root: bool, width: usize, out: &mut Vec<Line<'static>>, theme: &Theme) {
     let branch = if root {
         ""
     } else if last {
@@ -1288,40 +1231,37 @@ fn render_node(n: &ProcNode, prefix: &str, last: bool, root: bool, width: usize,
         "├─ "
     };
     let (tag, style) = match n.kind {
-        ProcKind::Agent => ("agent", Style::default().fg(Color::Green).bold()),
-        ProcKind::Subagent => ("subagent", Style::default().fg(Color::Green)),
-        ProcKind::Mcp => ("mcp", Style::default().fg(Color::Magenta).bold()),
-        ProcKind::Shell => ("shell", Style::default().fg(Color::Blue)),
-        ProcKind::Tool => ("tool", Style::default().fg(Color::White)),
+        ProcKind::Agent => ("agent", Style::default().fg(theme.green).bold()),
+        ProcKind::Subagent => ("subagent", Style::default().fg(theme.green)),
+        ProcKind::Mcp => ("mcp", Style::default().fg(theme.mauve).bold()),
+        ProcKind::Shell => ("shell", Style::default().fg(theme.blue)),
+        ProcKind::Tool => ("tool", Style::default().fg(theme.text)),
     };
     let head = format!("{prefix}{branch}");
     let stats = format!(" {:>6} {:>5.1}% {:>6} {:>5} ", n.pid, n.cpu_percent, bytes(n.rss_bytes), age(n.age_secs));
     let used = head.chars().count() + tag.len() + stats.len() + 2;
     let cmd = short_cmd(n, width.saturating_sub(used).max(8));
     out.push(Line::from(vec![
-        Span::styled(head, Style::default().fg(DIM)),
+        Span::styled(head, Style::default().fg(theme.dim)),
         Span::styled(format!("[{tag}]"), style),
-        Span::styled(stats, Style::default().fg(DIM)),
+        Span::styled(stats, Style::default().fg(theme.dim)),
         Span::raw(cmd),
     ]));
     let child_prefix = if root { String::new() } else { format!("{prefix}{}", if last { "   " } else { "│  " }) };
     let n_children = n.children.len();
     for (i, c) in n.children.iter().enumerate() {
-        render_node(c, &child_prefix, i + 1 == n_children, false, width, out);
+        render_node(c, &child_prefix, i + 1 == n_children, false, width, out, theme);
     }
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // A key badge: the letter on a coloured ground, its label dimmed beside it.
     let key = |k: &str, d: &str, bg: Color| -> Vec<Span<'static>> {
-        vec![
-            Span::styled(k.to_string(), Style::default().fg(Color::Black).bg(bg)),
-            Span::styled(format!(" {d} "), Style::default().fg(DIM)),
-        ]
+        vec![Span::styled(k.to_string(), theme.badge_style(bg)), Span::styled(format!(" {d} "), Style::default().fg(theme.dim))]
     };
-    let sep = || Span::styled("│ ", Style::default().fg(DIM));
+    let sep = || Span::styled("│ ", Style::default().fg(theme.dim));
 
-    let amber = Color::Rgb(220, 160, 40);
+    let amber = theme.peach;
     let mut left = Vec::new();
     // The panels, each in the colour of its panel; the pinned one is named
     // as the way back.
@@ -1331,9 +1271,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         for p in Panel::ALL {
             let (label, colour) = match p {
                 Panel::SlowTools => ("slow tools".to_string(), amber),
-                Panel::FailedTools => ("fails".to_string(), Color::Red),
-                Panel::Advice => (advice_label.clone(), ADVICE),
-                Panel::Mcp => ("mcp".to_string(), MCP),
+                Panel::FailedTools => ("fails".to_string(), theme.red),
+                Panel::Advice => (advice_label.clone(), theme.advice),
+                Panel::Mcp => ("mcp".to_string(), theme.mauve),
             };
             let label = if app.pinned == Some(p) && !app.standalone { format!("{label} ▸ table") } else { label };
             left.extend(key(&p.key().to_string(), &label, colour));
@@ -1342,37 +1282,37 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if let Some(notice) = app.current_notice() {
         // A fresh notice takes the bar for a few seconds: it is the answer to
         // the key the user just pressed.
-        left.push(Span::styled(format!(" {notice}"), Style::default().fg(ACCENT)));
+        left.push(Span::styled(format!(" {notice}"), Style::default().fg(theme.accent)));
     } else if app.pinned.is_some() {
-        left.extend(key("↑↓/jk", "scroll", ACCENT));
+        left.extend(key("↑↓/jk", "scroll", theme.accent));
         if !app.standalone {
-            left.extend(key("Esc", "table", ACCENT));
+            left.extend(key("Esc", "table", theme.accent));
         }
         if app.multiplexer.is_some() {
-            left.extend(key("o", "open in pane", ACCENT));
+            left.extend(key("o", "open in pane", theme.accent));
         }
-        left.extend(key("p", if app.paused { "resume" } else { "pause" }, ACCENT));
+        left.extend(key("p", if app.paused { "resume" } else { "pause" }, theme.accent));
         left.push(sep());
         panel_keys(&mut left);
         left.push(sep());
-        left.extend(key("?", "help", ACCENT));
+        left.extend(key("?", "help", theme.accent));
     } else {
         // Navigation and view.
-        left.extend(key("↑↓/jk", "select", ACCENT));
-        left.extend(key("s", format!("sort:{}{}", app.sort.label(), if app.sort_desc { "↑" } else { "↓" }).as_str(), ACCENT));
-        left.extend(key("r", "reverse", ACCENT));
-        left.extend(key("t", if app.show_detail { "hide detail" } else { "show detail" }, ACCENT));
-        left.extend(key("Tab", if app.detail == DetailView::Tree { "trace" } else { "tree" }, ACCENT));
+        left.extend(key("↑↓/jk", "select", theme.accent));
+        left.extend(key("s", format!("sort:{}{}", app.sort.label(), if app.sort_desc { "↑" } else { "↓" }).as_str(), theme.accent));
+        left.extend(key("r", "reverse", theme.accent));
+        left.extend(key("t", if app.show_detail { "hide detail" } else { "show detail" }, theme.accent));
+        left.extend(key("Tab", if app.detail == DetailView::Tree { "trace" } else { "tree" }, theme.accent));
         // `x` only matters when there are stopped sessions to hide; hiding it
         // otherwise keeps a key that does nothing off the bar.
         if app.snapshot.totals.stopped > 0 {
-            left.extend(key("x", if app.show_stopped { "hide stopped" } else { "show stopped" }, ACCENT));
+            left.extend(key("x", if app.show_stopped { "hide stopped" } else { "show stopped" }, theme.accent));
         }
-        left.extend(key("p", if app.paused { "resume" } else { "pause" }, ACCENT));
+        left.extend(key("p", if app.paused { "resume" } else { "pause" }, theme.accent));
         left.push(sep());
         panel_keys(&mut left);
         left.push(sep());
-        left.extend(key("?", "help", ACCENT));
+        left.extend(key("?", "help", theme.accent));
     }
 
     // The version badge and quit sit together at the right end. When the update
@@ -1380,20 +1320,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // arrow to it.
     let latest = app.latest();
     let (badge, badge_bg) = match &latest {
-        Some(newer) => (format!(" v{} → v{} ", crate::VERSION, newer), Color::Rgb(220, 160, 40)),
-        None => (format!(" v{} ", crate::VERSION), ACCENT),
+        Some(newer) => (format!(" v{} → v{} ", crate::VERSION, newer), theme.peach),
+        None => (format!(" v{} ", crate::VERSION), theme.accent),
     };
-    let mut right = vec![Span::styled(badge, Style::default().fg(Color::Black).bg(badge_bg)), Span::raw("  ")];
-    right.extend(key("q", "quit", ACCENT));
+    let mut right = vec![Span::styled(badge, theme.badge_style(badge_bg)), Span::raw("  ")];
+    right.extend(key("q", "quit", theme.accent));
     let right_w = right.iter().map(|s| s.content.chars().count()).sum::<usize>() as u16;
     let [left_area, right_area] = Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).areas(area);
     f.render_widget(Paragraph::new(Line::from(left)), left_area);
     f.render_widget(Paragraph::new(Line::from(right)), right_area);
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
+fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
     let lines = vec![
-        Line::from(vec![Span::styled("keys", Style::default().fg(ACCENT).bold())]),
+        Line::from(vec![Span::styled("keys", Style::default().fg(theme.accent).bold())]),
         Line::raw("  ↑ ↓ j k      move selection      g G     first / last"),
         Line::raw("  s            cycle sort column   r       reverse sort"),
         Line::raw("  t / Enter    toggle detail pane  x       toggle stopped rows"),
@@ -1401,36 +1341,36 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::raw("  p / Space    pause refresh       q / Esc quit"),
         Line::from(vec![
             Span::raw("  l            "),
-            Span::styled("slowest tools", Style::default().fg(Color::Rgb(220, 160, 40))),
+            Span::styled("slowest tools", Style::default().fg(theme.peach)),
             Span::raw("       f       "),
-            Span::styled("failed tool calls", Style::default().fg(Color::Red)),
+            Span::styled("failed tool calls", Style::default().fg(theme.red)),
         ]),
         Line::from(vec![
             Span::raw("  a            "),
-            Span::styled("advice", Style::default().fg(ADVICE)),
+            Span::styled("advice", Style::default().fg(theme.advice)),
             Span::raw(": oversized results, idle and growing MCP servers"),
         ]),
         Line::from(vec![
             Span::raw("  m            "),
-            Span::styled("mcp servers", Style::default().fg(MCP)),
+            Span::styled("mcp servers", Style::default().fg(theme.mauve)),
             Span::raw(": every server under every agent, and the orphans"),
         ]),
         Line::raw(""),
-        Line::from(vec![Span::styled("panels", Style::default().fg(ACCENT).bold())]),
+        Line::from(vec![Span::styled("panels", Style::default().fg(theme.accent).bold())]),
         Line::raw("  Each of l f a m is a popup over the table. On the popup:"),
         Line::raw("  Enter        fill the terminal with it; j k scroll, Esc back"),
         Line::raw("  o            open it in a new pane of the tmux, zellij,"),
         Line::raw("               WezTerm or kitty this runs in (shown only then)"),
         Line::raw("  agent-top slow | fails | advice | mcp   start on that panel"),
         Line::raw(""),
-        Line::from(vec![Span::styled(format!("agent-top {}", crate::VERSION), Style::default().fg(ACCENT).bold())]),
+        Line::from(vec![Span::styled(format!("agent-top {}", crate::VERSION), Style::default().fg(theme.accent).bold())]),
         Line::raw("  upgrade   asked once when a newer version is out (u runs the"),
         Line::raw("            installer that put agent-top here, n declines); or by hand:"),
         Line::raw("            brew update && brew upgrade agent-top | cargo install agent-top"),
-        Line::styled("  what's new  agent-top --whats-new", Style::default().fg(DIM)),
-        Line::styled(format!("  changelog   {}", crate::CHANGELOG_URL), Style::default().fg(DIM)),
+        Line::styled("  what's new  agent-top --whats-new", Style::default().fg(theme.dim)),
+        Line::styled(format!("  changelog   {}", crate::CHANGELOG_URL), Style::default().fg(theme.dim)),
         Line::raw(""),
-        Line::from(vec![Span::styled("columns", Style::default().fg(ACCENT).bold())]),
+        Line::from(vec![Span::styled("columns", Style::default().fg(theme.accent).bold())]),
         Line::raw("  STATE   running = mid-turn, idle = waiting for you,"),
         Line::raw("          stopped = transcript with no live process"),
         Line::raw("  TOKENS  input + cache read + cache write + output"),
@@ -1442,7 +1382,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::raw("          Model Context Protocol servers (name heuristic)"),
         Line::raw("  AGE     process age, or time since last write when stopped"),
         Line::raw(""),
-        Line::from(vec![Span::styled("tool trace", Style::default().fg(ACCENT).bold())]),
+        Line::from(vec![Span::styled("tool trace", Style::default().fg(theme.accent).bold())]),
         Line::raw("  Every tool call the harness logged, on a shared time axis."),
         Line::raw("  Width  = the call's share of the window on screen."),
         Line::raw("  Colour = how long it took: green under a second, amber a"),
@@ -1452,13 +1392,13 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::raw("  in tools = share of the window covered by at least one call;"),
         Line::raw("           the rest of it is the model thinking."),
         Line::raw(""),
-        Line::from(vec![Span::styled("context", Style::default().fg(ACCENT).bold())]),
+        Line::from(vec![Span::styled("context", Style::default().fg(theme.accent).bold())]),
         Line::raw("  What each tool's results added to the prompt, and what"),
         Line::raw("  re-reading them on every response since has cost. Results"),
         Line::raw("  answered together share the growth evenly: an estimate."),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("orphaned mcp", Style::default().fg(Color::Red).bold()),
+            Span::styled("orphaned mcp", Style::default().fg(theme.red).bold()),
             Span::raw("  MCP-looking processes whose agent is gone."),
         ]),
         Line::raw("  Inspect with `agent-top --json`; kill with `kill <pid>`."),
@@ -1469,15 +1409,17 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let h = (lines.len() as u16 + 3).min(area.height.saturating_sub(2));
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(Text::from(lines)).block(block("help")).wrap(Wrap { trim: false }), popup);
+    f.render_widget(Paragraph::new(Text::from(lines)).style(theme.style()).block(block("help", theme)).wrap(Wrap { trim: false }), popup);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemeMode;
     use agent_top_core::{HostStats, Snapshot, TokenUsage, Totals};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
     fn span(name: &str, start_s: u64, dur_ms: Option<u64>, sidechain: bool, error: bool) -> ToolSpan {
         ToolSpan {
@@ -1552,10 +1494,14 @@ mod tests {
         s
     }
 
-    fn render(app: &mut App, w: u16, h: u16) -> String {
+    fn render_buffer(app: &mut App, w: u16, h: u16, theme: &Theme) -> Buffer {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| draw(f, app)).unwrap();
-        let buf = term.backend().buffer().clone();
+        term.draw(|f| draw(f, app, theme)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn render(app: &mut App, w: u16, h: u16) -> String {
+        let buf = render_buffer(app, w, h, &Theme::new(ThemeMode::Dark, true));
         (0..buf.area.height)
             .map(|y| {
                 let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
@@ -1563,6 +1509,154 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn text_position(buf: &Buffer, text: &str) -> (u16, u16) {
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(byte) = row.find(text) {
+                return (row[..byte].chars().count() as u16, y);
+            }
+        }
+        panic!("{text:?} not found in rendered frame");
+    }
+
+    fn assert_text_style(buf: &Buffer, text: &str, foreground: Color, background: Color) {
+        let (x, y) = text_position(buf, text);
+        for dx in 0..text.chars().count() as u16 {
+            let cell = &buf[(x + dx, y)];
+            assert_eq!((cell.fg, cell.bg), (foreground, background), "{text:?} at ({}, {y})", x + dx);
+        }
+    }
+
+    #[test]
+    fn both_themes_style_normal_text_selections_and_badges() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            for truecolor in [true, false] {
+                let theme = Theme::new(mode, truecolor);
+                let mut app = App::new(mcp_snapshot());
+                app.show_detail = false;
+                let buf = render_buffer(&mut app, 160, 40, &theme);
+
+                assert_text_style(&buf, &app.rows[app.selected].name, theme.text, theme.selection);
+                assert_text_style(&buf, &app.rows[1].name, theme.text, theme.background);
+                assert_text_style(&buf, "cpu", theme.text, theme.background);
+                assert_text_style(&buf, "out tok/s", theme.dim, theme.background);
+                assert_text_style(&buf, "HARNESS", theme.accent, theme.background);
+                assert_eq!((buf[(0, 0)].fg, buf[(0, 0)].bg), (theme.border, theme.background));
+                let (x, y) = text_position(&buf, "q quit");
+                let badge = theme.badge_style(theme.accent);
+                assert_eq!((buf[(x, y)].fg, buf[(x, y)].bg), (badge.fg.unwrap(), theme.accent));
+                assert!(buf.content.iter().all(|cell| cell.fg != Color::Reset && cell.bg != Color::Reset));
+            }
+        }
+    }
+
+    #[test]
+    fn both_themes_restore_popup_styles_after_clear() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let theme = Theme::new(mode, true);
+            let mut app = App::new(snapshot(vec![agent("worker", Vec::new())]));
+            *app.update.lock().unwrap() = Some("99.9.9".into());
+            app.installer = crate::update::Installer::Homebrew;
+            for (overlay, title, accent, body) in [
+                (Overlay::Help, "help", theme.accent, "cycle sort column"),
+                (Overlay::Update, "update available", theme.peach, "is available; this is"),
+            ] {
+                app.overlay = overlay;
+                let buf = render_buffer(&mut app, 120, 60, &theme);
+                assert_text_style(&buf, title, accent, theme.background);
+                assert_text_style(&buf, body, theme.text, theme.background);
+                assert!(buf.content.iter().all(|cell| cell.fg != Color::Reset && cell.bg != Color::Reset));
+                if overlay == Overlay::Update {
+                    assert_text_style(&buf, "  u ", theme.badge_style(theme.peach).fg.unwrap(), theme.peach);
+                    assert_text_style(&buf, "  n ", theme.badge_style(theme.accent).fg.unwrap(), theme.accent);
+                }
+            }
+            app.installer = crate::update::Installer::Unknown;
+            let buf = render_buffer(&mut app, 120, 60, &theme);
+            assert_text_style(&buf, "This binary was not installed", theme.text, theme.background);
+            assert_text_style(&buf, "  n ", theme.badge_style(theme.accent).fg.unwrap(), theme.accent);
+        }
+    }
+
+    #[test]
+    fn both_themes_style_peeked_and_pinned_panels() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let theme = Theme::new(mode, true);
+            let mut snap = mcp_snapshot();
+            snap.agents[0].spans.push(span("PanelTool", 100, Some(2_500), false, true));
+            for panel in Panel::ALL {
+                let (accent, text, foreground) = match panel {
+                    Panel::SlowTools => (theme.peach, "PanelTool", theme.text),
+                    Panel::FailedTools => (theme.red, "PanelTool", theme.text),
+                    Panel::Advice => (theme.advice, "nothing to suggest", theme.dim),
+                    Panel::Mcp => (theme.mauve, "filesystem", theme.mauve),
+                };
+                for pinned in [false, true] {
+                    let mut app = App::new(snap.clone());
+                    app.show_detail = false;
+                    if pinned {
+                        app.pin(panel);
+                    } else {
+                        app.overlay = Overlay::Panel(panel);
+                    }
+                    let buf = render_buffer(&mut app, 160, 44, &theme);
+                    assert_text_style(&buf, panel.title(), accent, theme.background);
+                    assert_text_style(&buf, text, foreground, theme.background);
+                    assert!(buf.content.iter().all(|cell| cell.fg != Color::Reset && cell.bg != Color::Reset));
+                    if pinned {
+                        assert_eq!((buf[(1, 40)].fg, buf[(1, 40)].bg), (theme.text, theme.background));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_themes_use_their_meter_tracks_and_trace_ramps() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let theme = Theme::new(mode, true);
+            let mut inference = span("inference", 130, Some(5_000), false, false);
+            inference.kind = SpanKind::Inference;
+            let spans = vec![
+                span("Clean", 100, Some(500), false, false),
+                span("Sidechain", 110, Some(2_000), true, false),
+                span("Failed", 120, Some(1_000), false, true),
+                inference,
+                span("Pending", 140, None, false, false),
+            ];
+            let mut app = App::new(snapshot(vec![agent("worker", spans)]));
+            app.detail = DetailView::Trace;
+            let buf = render_buffer(&mut app, 160, 40, &theme);
+
+            let cpu: Vec<_> = (0..buf.area.width).map(|x| &buf[(x, 1)]).filter(|c| c.symbol() == METER_FULL).collect();
+            let track = (0..buf.area.width).filter(|&x| buf[(x, 1)].symbol() == METER_TRACK).count();
+            assert!(!cpu.is_empty() && track > 0);
+            assert_eq!(cpu.last().unwrap().fg, theme.ramp_load.at(cpu.len() as f64 / (cpu.len() + track) as f64));
+
+            for (label, ramp, elapsed) in [
+                ("Clean", &theme.ramp_ok, 500),
+                ("Sidechain", &theme.ramp_subagent, 2_000),
+                ("Failed", &theme.ramp_error, 1_000),
+                // Include the padding so the facts pane's model label cannot match.
+                ("model         ", &theme.ramp_inference, 5_000),
+                ("Pending", &theme.ramp_open, 20_000),
+            ] {
+                let y = (0..buf.area.height)
+                    .find(|&y| {
+                        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                        row.contains(label) && (row.contains(METER_FULL) || row.contains(METER_TIP))
+                    })
+                    .expect("trace row with a bar");
+                let tip =
+                    (0..buf.area.width).rev().map(|x| &buf[(x, y)]).find(|c| c.symbol() == METER_FULL || c.symbol() == METER_TIP).unwrap();
+                assert_eq!((tip.fg, tip.bg), (ramp.at(heat(elapsed)), theme.background), "{mode:?}: {label}");
+            }
+            for cell in buf.content.iter().filter(|c| c.symbol() == METER_TRACK) {
+                assert_eq!((cell.fg, cell.bg), (theme.track, theme.background));
+            }
+        }
     }
 
     /// The cost is shown one line per kind of token with the price it was
@@ -1966,44 +2060,6 @@ mod tests {
     }
 
     #[test]
-    fn the_ramp_runs_cool_to_hot() {
-        // Ends are the stops themselves, the middle is the middle stop.
-        assert_eq!(RAMP_OK.rgb_at(0.0), (0x4c, 0xc3, 0x8a));
-        assert_eq!(RAMP_OK.rgb_at(0.5), (0xd8, 0xc0, 0x4a));
-        assert_eq!(RAMP_OK.rgb_at(1.0), (0xe0, 0x7b, 0x39));
-        // Out-of-range input is clamped, not wrapped: a bar cannot go cold
-        // again by being longer than the meter.
-        assert_eq!(RAMP_OK.rgb_at(4.0), RAMP_OK.rgb_at(1.0));
-        assert_eq!(RAMP_OK.rgb_at(-1.0), RAMP_OK.rgb_at(0.0));
-        // Green channel falls and red rises as a call takes longer.
-        let (r0, g0, _) = RAMP_OK.rgb_at(0.1);
-        let (r1, g1, _) = RAMP_OK.rgb_at(0.9);
-        assert!(r1 > r0 && g1 < g0, "{r0},{g0} -> {r1},{g1}");
-        // The error ramp stays in the red family at every point, so a failure
-        // never reads as a merely slow call.
-        for i in 0..=10 {
-            let (r, g, b) = RAMP_ERROR.rgb_at(i as f64 / 10.0);
-            assert!(r > g && r > b, "error ramp went off-hue at {i}: {r},{g},{b}");
-        }
-    }
-
-    #[test]
-    fn falls_back_to_the_256_colour_palette() {
-        // Cube entries: index 16 is black, 231 is white.
-        assert_eq!(xterm256((0, 0, 0)), 232, "near-black lands on the grey ramp");
-        assert_eq!(xterm256((255, 0, 0)), 16 + 36 * 5, "pure red");
-        assert_eq!(xterm256((0, 255, 0)), 16 + 6 * 5, "pure green");
-        assert_eq!(xterm256((0x3a, 0x3a, 0x3a)), 232 + (0x3a_u16 * 23 / 255) as u8, "the track is a grey");
-        // Every ramp position must map into the palette's valid range.
-        for ramp in [&RAMP_OK, &RAMP_SUBAGENT, &RAMP_OPEN, &RAMP_ERROR, &RAMP_LOAD] {
-            for i in 0..=20 {
-                let idx = xterm256(ramp.rgb_at(i as f64 / 20.0));
-                assert!(idx >= 16, "index {idx} collides with the terminal's own ANSI colours");
-            }
-        }
-    }
-
-    #[test]
     fn heat_is_log_scaled_and_bounded() {
         assert_eq!(heat(0), 0.0, "anything under the floor is the coolest colour");
         assert_eq!(heat(50), 0.0);
@@ -2025,9 +2081,7 @@ mod tests {
         let spans = vec![span("Quick", 100, Some(40), false, false), span("Slow", 130, Some(30_000), false, false)];
         let mut app = App::new(snapshot(vec![agent("tuff-25", spans)]));
         app.detail = DetailView::Trace;
-        let mut term = Terminal::new(TestBackend::new(120, 26)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = term.backend().buffer().clone();
+        let buf = render_buffer(&mut app, 120, 26, &Theme::new(ThemeMode::Dark, true));
         let colors: Vec<Color> = (0..buf.area.height)
             .filter_map(|y| {
                 let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
@@ -2047,9 +2101,7 @@ mod tests {
         let spans = vec![span("Short", 100, Some(500), false, false), span("Long", 100, Some(59_000), false, false)];
         let mut app = App::new(snapshot(vec![agent("tuff-25", spans)]));
         app.detail = DetailView::Trace;
-        let mut term = Terminal::new(TestBackend::new(120, 26)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = term.backend().buffer().clone();
+        let buf = render_buffer(&mut app, 120, 26, &Theme::new(ThemeMode::Dark, true));
 
         let tip_of = |needle: &str| -> Color {
             let row = |y: u16| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
