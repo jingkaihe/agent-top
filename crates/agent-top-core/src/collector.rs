@@ -154,7 +154,7 @@ impl Collector {
         // Each adapter sees all of its processes before any is attributed.
         for a in &mut self.adapters {
             let mine: Vec<&ProcNode> = roots.iter().filter(|r| r.harness == Some(a.harness())).collect();
-            a.prepare(&mine);
+            a.prepare(&mine, &by_pid);
         }
 
         let now = SystemTime::now();
@@ -199,6 +199,7 @@ impl Collector {
                     activity: summary.activity,
                     pid: Some(root.pid),
                     session_id: hints.session_id.clone(),
+                    subagent: None,
                     session_path: None,
                     cwd,
                     model: None,
@@ -230,13 +231,20 @@ impl Collector {
                 continue;
             }
 
-            for (i, path) in paths.iter().enumerate() {
-                // Only the first row carries the process, so that a machine's
-                // totals are not multiplied by the number of conversations.
-                let owns_process = i == 0;
-                let Some(tr) = self.tracker_for(path, harness) else { continue };
-                let _ = tr.refresh();
-                let mut summary = tr.summary().clone();
+            let sessions: Vec<_> = paths
+                .iter()
+                .filter_map(|path| {
+                    let tr = self.tracker_for(path, harness)?;
+                    let _ = tr.refresh();
+                    Some((path, tr.summary().clone()))
+                })
+                .collect();
+            // Count the host's resources once, preferring a main session over
+            // its newest subagent. If only children are visible, one still
+            // carries the shared process, never a guessed per-session share.
+            let process_owner = sessions.iter().position(|(_, s)| s.subagent.is_none()).unwrap_or(0);
+            for (i, (path, mut summary)) in sessions.into_iter().enumerate() {
+                let owns_process = i == process_owner;
                 attached.insert(path.clone());
 
                 if summary.session_id.is_none() {
@@ -267,6 +275,7 @@ impl Collector {
                     activity: summary.activity,
                     pid: Some(root.pid),
                     session_id: summary.session_id.clone(),
+                    subagent: summary.subagent.clone(),
                     session_path: Some(path.clone()),
                     cwd: summary.cwd.clone().or_else(|| cwd.clone()),
                     model: summary.model.clone(),
@@ -318,6 +327,7 @@ impl Collector {
                 activity: s.activity,
                 pid: None,
                 session_id: Some(id),
+                subagent: s.subagent.clone(),
                 session_path: Some(p),
                 cwd: s.cwd.clone(),
                 model: s.model.clone(),
@@ -555,6 +565,106 @@ fn display_name(harness: Harness, cwd: Option<&Path>) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_session_lineage_survives_collection_without_duplicating_resources() {
+        use crate::harness::codex::CodexTranscript;
+        use serde_json::json;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // A harmless, owned process with agent argv[0], not a real Codex run.
+        // Closing stdin ends it normally; no signals or agent mutations.
+        let mut child = Command::new("cat").arg0("codex").stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let dir = std::env::temp_dir().join(format!("agent-top-lineage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = Vec::new();
+        for (id, parent, tokens) in [("child", Some("parent"), 20), ("parent", None, 100), ("finished", Some("parent"), 5)] {
+            let source = parent
+                .map(|parent| {
+                    json!({"subagent": {"thread_spawn": {
+                        "parent_thread_id": parent, "depth": 1, "agent_nickname": "Scout", "agent_role": "explorer"
+                    }}})
+                })
+                .unwrap_or(json!("cli"));
+            let meta = json!({"type": "session_meta", "payload": {"id": id, "cwd": "/example", "source": source}});
+            let usage = json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": tokens}
+            }}});
+            // Codex forks copy the parent's header after the new rollout's own.
+            let inherited = parent
+                .map(|id| {
+                    json!({"type": "session_meta", "payload": {
+                        "id": id, "cwd": "/example", "source": "cli"
+                    }})
+                    .to_string()
+                        + "\n"
+                })
+                .unwrap_or_default();
+            let path = dir.join(format!("{id}.jsonl"));
+            std::fs::write(&path, format!("{meta}\n{inherited}{usage}\n")).unwrap();
+            paths.push(path);
+        }
+
+        struct FixtureCodex {
+            pid: u32,
+            paths: Vec<PathBuf>,
+        }
+        impl HarnessAdapter for FixtureCodex {
+            fn harness(&self) -> Harness {
+                Harness::Codex
+            }
+            fn rescan(&mut self, _since: SystemTime) {}
+            fn attribute(&self, root: &ProcNode, _raw: Option<&RawProc>, _ctx: &AttributeContext) -> (Vec<PathBuf>, Attribution) {
+                if root.pid == self.pid { (self.paths[..2].to_vec(), Attribution::OpenFile) } else { (Vec::new(), Attribution::None) }
+            }
+            fn unowned(&self, attached: &HashSet<PathBuf>) -> Vec<PathBuf> {
+                self.paths.iter().filter(|p| !attached.contains(*p)).cloned().collect()
+            }
+            fn open(&self, path: &Path, spans: SpanRetention) -> Box<dyn SessionTracker> {
+                Box::new(CodexTranscript::new(path).with_spans(spans))
+            }
+            fn detect(&self, _path: &Path) -> bool {
+                false
+            }
+            fn transcripts(&self) -> Vec<(String, PathBuf)> {
+                Vec::new()
+            }
+        }
+        let mut collector = Collector::new(CollectorOptions::default());
+        collector.adapters = vec![Box::new(FixtureCodex { pid: child.id(), paths })];
+        // Newest child is intentionally first, as open rollouts normally are.
+        let mut snap = collector.collect();
+        snap.agents.retain(|a| a.session_path.as_ref().is_some_and(|p| p.starts_with(&dir)));
+        assert_eq!(snap.agents.len(), 3);
+        assert_eq!(snap.agents.iter().map(|a| &a.id).collect::<HashSet<_>>().len(), 3, "each rollout has a unique selection key");
+        let find = |id| snap.agents.iter().find(|a| a.session_id.as_deref() == Some(id)).unwrap();
+        let parent = find("parent");
+        let subagent = find("child");
+        assert!(parent.subagent.is_none());
+        assert_eq!(parent.process_count, 1, "the main session owns the shared process even when it is not first");
+        assert!(parent.tree.is_some());
+        assert_eq!(subagent.subagent.as_ref().unwrap().parent_session_id, "parent");
+        assert_eq!(subagent.subagent.as_ref().unwrap().nickname.as_deref(), Some("Scout"));
+        assert_eq!(subagent.pid, parent.pid);
+        assert!(subagent.shares_process);
+        assert_eq!((subagent.process_count, subagent.rss_bytes, subagent.cpu_percent), (0, 0, 0.0));
+        assert!(subagent.tree.is_none());
+        assert_eq!(find("finished").state, AgentState::Stopped);
+        assert_eq!(find("finished").subagent.as_ref().unwrap().parent_session_id, "parent");
+        let rss = parent.rss_bytes;
+        snap.compute_totals();
+        assert_eq!(snap.totals.tokens, 125, "each transcript contributes usage once, not again through its parent");
+        assert_eq!(snap.totals.processes, 1);
+        assert_eq!(snap.totals.rss_bytes, rss);
+
+        let replay: Snapshot = serde_json::from_value(serde_json::to_value(&snap).unwrap()).unwrap();
+        assert_eq!(replay.agents[0].subagent, snap.agents[0].subagent);
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn the_registry_status_beats_the_transcript_heuristic() {
         let opts = CollectorOptions::default();
@@ -678,6 +788,7 @@ mod tests {
             activity: Activity::Working,
             pid: Some(10),
             session_id: None,
+            subagent: None,
             session_path: None,
             cwd: None,
             model: None,
@@ -753,6 +864,7 @@ mod tests {
             activity: Activity::Working,
             pid: Some(10),
             session_id: None,
+            subagent: None,
             session_path: None,
             cwd: None,
             model: None,

@@ -28,10 +28,24 @@
 //!
 //! Codex model prices are not in the static table, so cost is reported as
 //! unpriced tokens.
+//!
+//! Process semantics (source-verified against Codex 0.154.0, 2026-09-17):
+//! the npm launcher spawns a native runtime, which owns the rollout handles.
+//! Native `spawn_agent` creates an in-process session, not an OS process.
+//! Its lineage is `payload.source.subagent.thread_spawn.parent_thread_id` in
+//! session metadata, or `payload.parent_thread_id` when `thread_source` is
+//! explicitly `subagent`, never a PID relationship or `forked_from_id`.
+//! Nickname and role come from that source record (or the top-level metadata);
+//! older records name the role `agent_type`. Rollouts retain separate usage
+//! totals while the TUI groups them by parent. Memory belongs to the process,
+//! not to individual logical subagents sharing that process.
+//! Live 0.154.0 rollouts (2026-09-17) can copy ancestor `session_meta` records
+//! after the child's own header when forking history. The first identified
+//! header owns this rollout's identity and lineage; later headers do not.
 
 use super::{AttributeContext, HarnessAdapter, REFRESH_BUDGET_BYTES, SessionSummary, SessionTracker, SpanRetention, parse_rfc3339_utc};
 use crate::jsonl::TailReader;
-use crate::model::{Activity, Attribution, ContextOrigin, Harness, ProcNode, SpanKind, TokenUsage};
+use crate::model::{Activity, Attribution, ContextOrigin, Harness, ProcNode, SpanKind, SubagentInfo, TokenUsage};
 use crate::pricing::{self, Table};
 use crate::process::RawProc;
 use serde_json::Value;
@@ -68,6 +82,17 @@ pub fn rollouts_open_by(pid: u32) -> Option<Vec<PathBuf>> {
             .filter_map(|p| p.strip_prefix(&canonical).ok().map(|rel| root.join(rel)))
             .collect(),
     )
+}
+
+/// An npm launcher holds no rollouts; its native runtime does. Match the
+/// forwarded argv, never just an `Agent` child: a nested agent invocation
+/// owns its own sessions even though it is beneath this process.
+fn rollout_owner<'a>(root: &'a ProcNode, by_pid: &HashMap<u32, &RawProc>) -> &'a ProcNode {
+    let Some(parent) = by_pid.get(&root.pid) else { return root };
+    root.children
+        .iter()
+        .find(|p| p.harness == Some(Harness::Codex) && by_pid.get(&p.pid).is_some_and(|child| child.is_codex_runtime_of(parent)))
+        .unwrap_or(root)
 }
 
 /// Every rollout written since `since`.
@@ -143,8 +168,8 @@ impl HarnessAdapter for CodexAdapter {
         self.recent = recent_rollouts(since).into_iter().filter_map(|p| read_meta(&p).map(|(cwd, ts)| (p, cwd, ts))).collect();
     }
 
-    fn prepare(&mut self, roots: &[&ProcNode]) {
-        self.held = roots.iter().map(|r| (r.pid, rollouts_open_by(r.pid))).collect();
+    fn prepare(&mut self, roots: &[&ProcNode], by_pid: &HashMap<u32, &RawProc>) {
+        self.held = roots.iter().map(|r| (r.pid, rollouts_open_by(rollout_owner(r, by_pid).pid))).collect();
         self.all_held = self.held.values().flatten().flatten().cloned().collect();
     }
 
@@ -252,6 +277,25 @@ fn written_at(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
+fn subagent_info(meta: &Value) -> Option<SubagentInfo> {
+    let source = meta.pointer("/source/subagent/thread_spawn");
+    let parent = source.and_then(|s| s.get("parent_thread_id")).and_then(Value::as_str).or_else(|| {
+        (meta.get("thread_source").and_then(Value::as_str) == Some("subagent"))
+            .then(|| meta.get("parent_thread_id").and_then(Value::as_str))
+            .flatten()
+    })?;
+    let id = meta.get("id").or_else(|| meta.get("session_id")).and_then(Value::as_str);
+    if parent.is_empty() || Some(parent) == id {
+        return None;
+    }
+    let field = |key| source.and_then(|s| s.get(key)).and_then(Value::as_str).or_else(|| meta.get(key).and_then(Value::as_str));
+    Some(SubagentInfo {
+        parent_session_id: parent.to_string(),
+        nickname: field("agent_nickname").map(str::to_string),
+        role: field("agent_role").or_else(|| field("agent_type")).map(str::to_string),
+    })
+}
+
 pub struct CodexTranscript {
     reader: TailReader,
     prices: &'static Table,
@@ -333,9 +377,12 @@ impl CodexTranscript {
         let payload = v.get("payload");
         let ptype = payload.and_then(|p| p.get("type")).and_then(Value::as_str).unwrap_or("");
         match kind {
-            "session_meta" => {
+            // Forked history can contain parent headers, including across tail
+            // refreshes. They must not replace this rollout's own metadata.
+            "session_meta" if self.summary.session_id.is_none() => {
                 if let Some(p) = payload {
                     self.summary.session_id = p.get("id").or(p.get("session_id")).and_then(Value::as_str).map(str::to_string);
+                    self.summary.subagent = subagent_info(p);
                     self.summary.cwd = p.get("cwd").and_then(Value::as_str).map(PathBuf::from);
                     self.summary.harness_version = p.get("cli_version").and_then(Value::as_str).map(str::to_string);
                 }
@@ -662,6 +709,131 @@ mod tests {
         assert_eq!(attribution, Attribution::None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollout_owner_follows_the_launcher_runtime_but_not_nested_agents() {
+        let proc = |pid, ppid, cmd: &[&str]| RawProc {
+            pid,
+            ppid,
+            name: cmd[0].into(),
+            exe: None,
+            cmd: cmd.iter().map(|s| (*s).into()).collect(),
+            cwd: None,
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            start_time: 0,
+            run_time: 1,
+        };
+        let procs = [
+            proc(10, None, &["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js", "--yolo"]),
+            proc(11, Some(10), &["codex", "--yolo"]),
+            proc(12, Some(11), &["codex", "exec", "review"]),
+        ];
+        let (roots, _) = crate::process::build_forest(&procs);
+        let by_pid = procs.iter().map(|p| (p.pid, p)).collect();
+        let root = &roots[0];
+        assert_eq!(rollout_owner(root, &by_pid).pid, 11, "read the native runtime's descriptors, not the launcher's");
+        assert_eq!(rollout_owner(&root.children[0], &by_pid).pid, 11, "never claim a nested agent's rollouts");
+        assert_eq!(rollout_owner(&root.children[0].children[0], &by_pid).pid, 12);
+    }
+
+    #[test]
+    fn reads_explicit_subagent_lineage_and_identity() {
+        use serde_json::json;
+
+        let mut t = CodexTranscript::new("unused.jsonl");
+        t.ingest(
+            &json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "child", "session_id": "root", "cli_version": "0.154.0",
+                    "forked_from_id": "history-source",
+                    "source": {"subagent": {"thread_spawn": {
+                        "parent_thread_id": "parent", "depth": 2,
+                        "agent_nickname": "Scout", "agent_role": "explorer"
+                    }}}
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(t.summary.session_id.as_deref(), Some("child"), "thread id wins over root session_id");
+        assert_eq!(
+            t.summary.subagent,
+            Some(SubagentInfo { parent_session_id: "parent".into(), nickname: Some("Scout".into()), role: Some("explorer".into()) })
+        );
+
+        // New metadata also carries explicit lineage at the top level. A bare
+        // parent_thread_id without the subagent source must not be inferred.
+        let meta = json!({"id": "child", "thread_source": "subagent", "parent_thread_id": "parent", "agent_type": "worker"});
+        assert_eq!(
+            subagent_info(&meta),
+            Some(SubagentInfo { parent_session_id: "parent".into(), nickname: None, role: Some("worker".into()) })
+        );
+        let meta = json!({"id": "child", "agent_nickname": "Scout", "source": {"subagent": {"thread_spawn": {
+            "parent_thread_id": "parent", "agent_type": "worker"
+        }}}});
+        assert_eq!(subagent_info(&meta).unwrap().nickname.as_deref(), Some("Scout"));
+        assert_eq!(subagent_info(&meta).unwrap().role.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn inherited_session_headers_do_not_replace_the_rollouts_identity() {
+        use serde_json::json;
+
+        let dir = std::env::temp_dir().join(format!("agent-top-codex-inherited-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("child.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let own = json!({"type": "session_meta", "payload": {
+            "id": "child", "session_id": "parent", "cwd": "/child", "cli_version": "0.154.0",
+            "source": {"subagent": {"thread_spawn": {
+                "parent_thread_id": "parent", "agent_nickname": "Scout", "agent_role": "explorer"
+            }}}
+        }});
+        writeln!(file, "{own}").unwrap();
+        let mut t = CodexTranscript::new(&path);
+        t.refresh().unwrap();
+
+        // Forked history follows the child's own header, possibly across refreshes.
+        for id in ["parent", "grandparent"] {
+            let inherited = json!({"type": "session_meta", "payload": {
+                "id": id, "cwd": "/ancestor", "cli_version": "0.149.0", "source": "cli"
+            }});
+            writeln!(file, "{inherited}").unwrap();
+            t.refresh().unwrap();
+            assert_eq!(t.summary.session_id.as_deref(), Some("child"));
+            assert_eq!(t.summary.cwd.as_deref(), Some(Path::new("/child")));
+            assert_eq!(t.summary.harness_version.as_deref(), Some("0.154.0"));
+            assert_eq!(
+                t.summary.subagent,
+                Some(SubagentInfo { parent_session_id: "parent".into(), nickname: Some("Scout".into()), role: Some("explorer".into()) })
+            );
+        }
+        let usage = json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 42}
+        }}});
+        writeln!(file, "{usage}").unwrap();
+        t.refresh().unwrap();
+        assert_eq!(t.summary.usage.input, 42, "continue reading events after inherited headers");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn never_infers_subagents_from_forks_or_incomplete_metadata() {
+        use serde_json::json;
+
+        for meta in [
+            json!({"id": "child", "source": "cli", "forked_from_id": "parent"}),
+            json!({"id": "child", "parent_thread_id": "parent"}),
+            json!({"id": "child", "source": {"subagent": "review"}}),
+            json!({"id": "child", "source": {"subagent": {"thread_spawn": {"depth": 1}}}}),
+            json!({"id": "child", "source": {"subagent": {"thread_spawn": {"parent_thread_id": ""}}}}),
+            json!({"id": "child", "thread_source": "subagent", "parent_thread_id": "child"}),
+            json!({"id": "child", "source": {"subagent": {"thread_spawn": {"parent_thread_id": 42}}}}),
+        ] {
+            assert_eq!(subagent_info(&meta), None, "{meta}");
+        }
     }
 
     #[test]

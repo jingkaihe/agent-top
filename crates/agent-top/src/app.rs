@@ -2,7 +2,7 @@
 
 use agent_top_core::{Agent, AgentState, Snapshot};
 use ratatui::crossterm::event::KeyCode;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +44,7 @@ impl SortKey {
 /// Which panel the right half of the detail pane shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailView {
-    /// The live process tree, plus orphaned MCP servers.
+    /// Explicit session lineage, the live process tree, and orphaned MCP servers.
     Tree,
     /// A waterfall of the agent's recent tool calls.
     Trace,
@@ -63,6 +63,81 @@ impl DetailView {
             DetailView::Tree => DetailView::Trace,
             DetailView::Trace => DetailView::Tree,
         }
+    }
+}
+
+/// A session forest built only from explicit transcript lineage. Input order
+/// determines root/sibling order; PIDs and working directories are irrelevant.
+pub(crate) struct SessionTree {
+    pub parents: Vec<Option<usize>>,
+    pub order: Vec<(usize, usize)>,
+}
+
+impl SessionTree {
+    pub fn new(agents: &[Agent]) -> Self {
+        let mut sessions = HashMap::new();
+        for (i, agent) in agents.iter().enumerate() {
+            if let Some(id) = agent.session_id.as_deref() {
+                // An ambiguous session ID is not enough evidence to pick one
+                // of several parents. Keep its children visible as roots.
+                sessions.entry((agent.harness, id)).and_modify(|index| *index = None).or_insert(Some(i));
+            }
+        }
+        let mut parents: Vec<Option<usize>> = agents
+            .iter()
+            .enumerate()
+            .map(|(i, agent)| {
+                let info = agent.subagent.as_ref()?;
+                sessions.get(&(agent.harness, info.parent_session_id.as_str())).copied().flatten().filter(|&parent| parent != i)
+            })
+            .collect();
+
+        // Break corrupt/replayed cycles before traversal. Every row remains
+        // visible once, and iteration avoids overflowing on a deep hierarchy.
+        let mut state = vec![0; agents.len()];
+        for start in 0..agents.len() {
+            let mut path = Vec::new();
+            let mut current = Some(start);
+            while let Some(i) = current {
+                if state[i] == 2 {
+                    break;
+                }
+                if state[i] == 1 {
+                    parents[i] = None;
+                    break;
+                }
+                state[i] = 1;
+                path.push(i);
+                current = parents[i];
+            }
+            for i in path {
+                state[i] = 2;
+            }
+        }
+
+        let mut children = vec![Vec::new(); agents.len()];
+        let mut roots = Vec::new();
+        for (i, parent) in parents.iter().enumerate() {
+            if let Some(parent) = parent {
+                children[*parent].push(i);
+            } else {
+                roots.push(i);
+            }
+        }
+        let mut pending: Vec<_> = roots.into_iter().rev().map(|i| (i, 0)).collect();
+        let mut order = Vec::with_capacity(agents.len());
+        while let Some((i, depth)) = pending.pop() {
+            order.push((i, depth));
+            pending.extend(children[i].iter().rev().map(|&child| (child, depth + 1)));
+        }
+        Self { parents, order }
+    }
+
+    pub fn root(&self, mut index: usize) -> usize {
+        while let Some(parent) = self.parents[index] {
+            index = parent;
+        }
+        index
     }
 }
 
@@ -148,6 +223,8 @@ const NOTICE_FOR: Duration = Duration::from_secs(5);
 pub struct App {
     pub snapshot: Snapshot,
     pub rows: Vec<Agent>,
+    /// Depth in the explicit session hierarchy, parallel to `rows`.
+    pub row_depths: Vec<usize>,
     pub selected_id: Option<String>,
     pub selected: usize,
     pub sort: SortKey,
@@ -201,6 +278,7 @@ impl App {
         let mut app = App {
             snapshot,
             rows: Vec::new(),
+            row_depths: Vec::new(),
             selected_id: None,
             selected: 0,
             sort: SortKey::State,
@@ -307,7 +385,7 @@ impl App {
         rows.sort_by(|a, b| {
             let ord = match key {
                 SortKey::State => a.state.cmp(&b.state).then_with(|| b.usage.total().cmp(&a.usage.total())),
-                SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortKey::Name => crate::format::session_name(a).to_lowercase().cmp(&crate::format::session_name(b).to_lowercase()),
                 SortKey::Tokens => b.usage.total().cmp(&a.usage.total()),
                 SortKey::Cost => b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal),
                 SortKey::Cpu => b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal),
@@ -316,7 +394,9 @@ impl App {
             };
             if self.sort_desc { ord.reverse() } else { ord }
         });
-        self.rows = rows;
+        let hierarchy = SessionTree::new(&rows);
+        self.row_depths = hierarchy.order.iter().map(|&(_, depth)| depth).collect();
+        self.rows = hierarchy.order.into_iter().map(|(i, _)| rows[i].clone()).collect();
         // Keep the cursor on the same agent across refreshes.
         if let Some(id) = &self.selected_id
             && let Some(i) = self.rows.iter().position(|a| &a.id == id)
@@ -576,6 +656,7 @@ mod tests {
             activity: Activity::Working,
             pid: Some(1),
             session_id: None,
+            subagent: None,
             session_path: None,
             cwd: None,
             model: None,
@@ -616,6 +697,148 @@ mod tests {
         };
         s.compute_totals();
         s
+    }
+
+    fn session(id: &str, parent: Option<&str>, output: u64) -> Agent {
+        let mut a = snapshot(output).agents.remove(0);
+        a.id = id.into();
+        a.name = id.into();
+        a.session_id = Some(id.into());
+        a.harness = Harness::Codex;
+        a.subagent = parent.map(|id| agent_top_core::SubagentInfo { parent_session_id: id.into(), nickname: None, role: None });
+        a
+    }
+
+    fn session_app(agents: Vec<Agent>) -> App {
+        let mut s = snapshot(0);
+        s.agents = agents;
+        s.compute_totals();
+        App::new(s)
+    }
+
+    #[test]
+    fn session_hierarchy_preserves_sibling_sort_and_selection() {
+        let mut app = session_app(vec![
+            session("child-b", Some("root-a"), 30),
+            session("root-z", None, 80),
+            session("grandchild", Some("child-a"), 100),
+            session("root-a", None, 10),
+            session("child-a", Some("root-a"), 20),
+        ]);
+        app.sort = SortKey::Name;
+        app.rebuild_rows();
+        let ids = |app: &App| app.rows.iter().map(|a| a.id.as_str()).collect::<Vec<_>>().join(",");
+        assert_eq!(ids(&app), "root-a,child-a,grandchild,child-b,root-z");
+        assert_eq!(app.row_depths, vec![0, 1, 2, 1, 0]);
+
+        app.select(2);
+        app.sort_desc = true;
+        app.rebuild_rows();
+        assert_eq!(ids(&app), "root-z,root-a,child-b,child-a,grandchild");
+        assert_eq!(app.selected_agent().unwrap().id, "grandchild");
+
+        app.sort = SortKey::Tokens;
+        app.sort_desc = false;
+        app.rebuild_rows();
+        assert_eq!(ids(&app), "root-z,root-a,child-b,child-a,grandchild");
+        let tokens_before = app.snapshot.totals.tokens;
+        app.snapshot.agents.reverse();
+        app.rebuild_rows();
+        assert_eq!(app.selected_agent().unwrap().id, "grandchild", "a refresh must keep the selected session");
+        assert_eq!(app.rows.iter().map(|a| a.usage.total()).sum::<u64>(), tokens_before, "grouping does not fold or duplicate usage");
+    }
+
+    #[test]
+    fn down_keeps_the_selected_subagent_across_refreshes_with_shared_pid_and_name() {
+        let parent = session("parent", None, 100);
+        let mut child = session("child", Some("parent"), 20);
+        child.name = parent.name.clone();
+        child.shares_process = true;
+        assert_eq!(child.pid, parent.pid);
+        let mut app = session_app(vec![child, parent]);
+        assert_eq!(app.row_depths, vec![0, 1]);
+        assert_eq!(app.selected_agent().unwrap().id, "parent");
+
+        app.on_key(KeyCode::Down);
+        for tick in 1..=3 {
+            let mut next = app.snapshot.clone();
+            next.agents.reverse();
+            app.update_at(next, Instant::now() + Duration::from_secs(tick));
+            assert_eq!(app.selected_agent().unwrap().id, "child", "refresh must not jump to the shared process owner");
+            assert_eq!(app.row_depths, vec![0, 1]);
+        }
+        app.on_key(KeyCode::Up);
+        assert_eq!(app.selected_agent().unwrap().id, "parent");
+    }
+
+    #[test]
+    fn session_name_sort_uses_displayed_nicknames() {
+        let mut scout = session("child-a", Some("parent"), 10);
+        let mut review = session("child-b", Some("parent"), 10);
+        scout.name = "codex:project".into();
+        review.name = scout.name.clone();
+        scout.subagent.as_mut().unwrap().nickname = Some("Scout".into());
+        review.subagent.as_mut().unwrap().nickname = Some("Review".into());
+        let mut app = session_app(vec![scout, review, session("parent", None, 0)]);
+        app.sort = SortKey::Name;
+        app.rebuild_rows();
+        assert_eq!(app.rows.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["parent", "child-b", "child-a"]);
+        app.sort_desc = true;
+        app.rebuild_rows();
+        assert_eq!(app.rows.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["parent", "child-a", "child-b"]);
+    }
+
+    #[test]
+    fn sessions_with_missing_or_hidden_parents_stay_visible() {
+        let mut parent = session("parent", None, 10);
+        parent.state = AgentState::Stopped;
+        let mut app = session_app(vec![parent, session("child", Some("parent"), 20), session("missing", Some("unknown"), 30)]);
+        app.sort = SortKey::Name;
+        app.rebuild_rows();
+        assert_eq!(app.rows.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["missing", "parent", "child"]);
+        assert_eq!(app.row_depths, vec![0, 0, 1]);
+        app.select(2);
+        app.show_stopped = false;
+        app.rebuild_rows();
+        assert_eq!(app.rows.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["child", "missing"]);
+        assert_eq!(app.row_depths, vec![0, 0]);
+        assert_eq!(app.selected_agent().unwrap().id, "child");
+        assert_eq!(app.rows[0].subagent.as_ref().unwrap().parent_session_id, "parent");
+    }
+
+    #[test]
+    fn session_hierarchy_uses_harness_and_identity_not_pid() {
+        let mut other_harness = session("parent", None, 0);
+        other_harness.id = "claude-parent".into();
+        other_harness.harness = Harness::Claude;
+        let agents = vec![other_harness, session("child", Some("parent"), 0), session("parent", None, 0), session("unrelated", None, 0)];
+        assert!(agents.iter().all(|a| a.pid == Some(1)), "the fixture deliberately shares a PID");
+        let hierarchy = SessionTree::new(&agents);
+        assert_eq!(hierarchy.parents, vec![None, Some(2), None, None]);
+        assert_eq!(hierarchy.order, vec![(0, 0), (2, 0), (1, 1), (3, 0)]);
+    }
+
+    #[test]
+    fn malformed_session_lineage_never_drops_or_repeats_rows() {
+        let mut duplicate = session("duplicate", None, 0);
+        duplicate.id = "second-copy".into();
+        let agents = vec![
+            session("a", Some("b"), 0),
+            session("b", Some("a"), 0),
+            session("self", Some("self"), 0),
+            session("duplicate", None, 0),
+            duplicate,
+            session("ambiguous", Some("duplicate"), 0),
+        ];
+        let hierarchy = SessionTree::new(&agents);
+        let mut indexes: Vec<_> = hierarchy.order.iter().map(|&(i, _)| i).collect();
+        indexes.sort_unstable();
+        assert_eq!(indexes, (0..agents.len()).collect::<Vec<_>>());
+        assert_eq!(hierarchy.parents[2], None);
+        assert_eq!(hierarchy.parents[5], None, "never choose an arbitrary duplicate parent");
+        for i in 0..agents.len() {
+            assert!(hierarchy.root(i) < agents.len(), "cycle traversal must terminate");
+        }
     }
 
     /// The question opens once when a newer version is known, not when that

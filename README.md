@@ -21,7 +21,7 @@ Coding agents have become long-running processes, and you tend to keep several a
 ## Key features
 
 - **[Every harness in one view](https://agenttop.dev/live-view/).** Claude Code, Codex, Gemini CLI and OpenCode sessions in a single table, live or recently stopped, so you never tab between four tools to see what is running.
-- **[Real tokens and cost](https://agenttop.dev/accounting/).** Counted from the harness's own transcript, never estimated, and priced from a table you can read and edit (Anthropic, OpenAI and Google list prices). Subagents are folded into their parent.
+- **[Real tokens and cost](https://agenttop.dev/accounting/).** Counted from the harness's own transcript, never estimated, and priced from a table you can read and edit (Anthropic, OpenAI and Google list prices). Codex subagent sessions are grouped by their recorded parent, with usage kept separate.
 - **[`agent-top report`](#what-it-all-costs-agent-top-report).** What all of it has cost, across every harness, from the transcripts on disk, grouped by harness, model, project or day. The one place that adds your agent spend up together.
 - **MCP leak detection.** One row per MCP server with its call count, and orphaned servers, a memory leak agent-top watches for on every tick, flagged in red with the agent they were orphaned from.
 - **[Context by source](https://agenttop.dev/accounting/#context-by-source).** Which tool's results are filling the prompt, and what re-reading them on every response since has cost: a `Read` that returned 40k tokens is billed again on every turn for the rest of the session, and no harness shows that. Computed from the usage records alone; no tool output is read.
@@ -81,8 +81,10 @@ and, for Claude Code, priced.
 
 Press `t` to open it and `Tab` to switch between two views.
 
-**Process tree.** Every process under the agent, labelled `agent`, `subagent`,
-`mcp`, `shell` or `tool`, with the token breakdown beside it.
+**Trees.** Codex sessions with recorded parent metadata are nested beneath their
+parent, with each session's own usage. The separate process tree labels real
+processes `agent`, `mcp`, `shell` or `tool`; nested processes are not assumed to
+be logical subagents, and shared process memory is counted once.
 
 **MCP servers.** Below the tree, one line per MCP server the agent uses: the
 server's pid, how many times the agent has called it, how many of those calls

@@ -1,8 +1,10 @@
 //! Rendering. Layout, top to bottom: header (host gauges + totals), agent
 //! table, optional detail pane (process tree + token breakdown), key bar.
 
-use crate::app::{App, DetailView, Overlay, Panel};
-use crate::format::{age, bytes, cost, cpu_cell, duration_ms, mem_cell, short_cmd, short_model, tokens, tokens_cell, truncate};
+use crate::app::{App, DetailView, Overlay, Panel, SessionTree};
+use crate::format::{
+    age, bytes, cost, cpu_cell, duration_ms, mem_cell, session_name, short_cmd, short_model, tokens, tokens_cell, truncate,
+};
 use agent_top_core::{Agent, AgentState, Attribution, McpMatch, OrphanOrigin, ProcKind, ProcNode, SpanKind, ToolSpan};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -718,12 +720,12 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     )
     .bottom_margin(0);
 
-    let rows = app.rows.iter().map(|a| {
+    let rows = app.rows.iter().enumerate().map(|(i, a)| {
         let mem = mem_cell(a);
         let cpu = cpu_cell(a);
         let mcp_style = if a.mcp_count > 0 { Style::default().fg(Color::Magenta) } else { Style::default() };
         Row::new(vec![
-            Cell::from(truncate(&a.name, 26)).style(Style::default().bold()),
+            Cell::from(table_session_name(a, app.row_depths[i])).style(Style::default().bold()),
             Cell::from(a.harness.label()),
             Cell::from(a.state.label()).style(state_style(a.state)),
             Cell::from(a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
@@ -790,16 +792,14 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(block("detail"), area);
         return;
     };
-    let title = format!("{} · {} · {}  [{}]", a.name, a.harness.label(), a.state.label(), app.detail.label());
+    let title = format!("{} · {} · {}  [{}]", session_name(a), a.harness.label(), a.state.label(), app.detail.label());
     let outer = block(&title);
     let inner = outer.inner(area);
     f.render_widget(outer, area);
     let [left, right] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(inner);
     f.render_widget(Paragraph::new(agent_facts(a, app.snapshot.taken_at)).wrap(Wrap { trim: false }), left);
     let panel = match app.detail {
-        DetailView::Tree => {
-            process_tree(a, &app.snapshot.orphans, &app.snapshot.orphan_origins, app.snapshot.taken_at, right.width as usize)
-        }
+        DetailView::Tree => tree_detail(app, a, right.width as usize, right.height as usize),
         DetailView::Trace => tool_trace(a, app.snapshot.taken_at, right.width as usize, right.height as usize),
     };
     f.render_widget(Paragraph::new(panel), right);
@@ -807,6 +807,18 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
 
 fn kv<'a>(k: &'a str, v: String) -> Line<'a> {
     Line::from(vec![Span::styled(format!("{k:<11}"), Style::default().fg(DIM)), Span::raw(v)])
+}
+
+fn table_session_name(a: &Agent, depth: usize) -> String {
+    let prefix = if depth > 0 {
+        format!("{}↳ ", "  ".repeat(depth.saturating_sub(1).min(8)))
+    } else if a.subagent.is_some() {
+        // Its parent may be missing, ambiguous or hidden by the stopped filter.
+        "[subagent] ".into()
+    } else {
+        String::new()
+    };
+    truncate(&format!("{prefix}{}", session_name(a)), 26)
 }
 
 /// One line of the cost breakdown: tokens, the price they were charged at,
@@ -920,8 +932,17 @@ fn agent_facts(a: &Agent, now: SystemTime) -> Text<'static> {
     // Identity first, then the headline numbers a glance wants (cost, cache,
     // turns, tools) high up, so a short detail pane never clips them; the
     // per-token cost breakdown, a dig-deeper detail, comes below them.
+    lines.push(kv("session", a.session_id.clone().unwrap_or_else(|| "-".into())));
+    if let Some(info) = &a.subagent {
+        lines.push(kv("parent", info.parent_session_id.clone()));
+        if let Some(nickname) = &info.nickname {
+            lines.push(kv("nickname", nickname.clone()));
+        }
+        if let Some(role) = &info.role {
+            lines.push(kv("role", role.clone()));
+        }
+    }
     lines.extend(vec![
-        kv("session", a.session_id.clone().unwrap_or_else(|| "-".into())),
         kv("cwd", a.cwd.as_deref().map(tilde).unwrap_or_else(|| "-".into())),
         kv("model", a.model.clone().unwrap_or_else(|| "-".into())),
         kv("version", a.harness_version.clone().unwrap_or_else(|| "-".into())),
@@ -935,7 +956,14 @@ fn agent_facts(a: &Agent, now: SystemTime) -> Text<'static> {
         ]),
         cache_line(a),
         kv("tokens", tokens(u.total())),
-        kv("turns", format!("{} ({} subagent)", a.turns, a.subagent_turns)),
+        kv(
+            "turns",
+            if a.harness == agent_top_core::Harness::Codex {
+                a.turns.to_string()
+            } else {
+                format!("{} ({} subagent)", a.turns, a.subagent_turns)
+            },
+        ),
         kv("tool calls", a.tool_calls.to_string()),
     ]);
     if a.web_searches > 0 {
@@ -1153,15 +1181,82 @@ fn busy_ms(shown: &[&ToolSpan], now: SystemTime) -> u64 {
     total.as_millis() as u64
 }
 
-fn process_tree(a: &Agent, orphans: &[ProcNode], origins: &[OrphanOrigin], now: SystemTime, width: usize) -> Text<'static> {
+/// Session lineage and OS ancestry are deliberately separate sections. The
+/// first has per-session usage, while all CPU/RSS comes from the process owner.
+fn tree_detail(app: &App, selected: &Agent, width: usize, height: usize) -> Text<'static> {
+    let mut lines = Vec::new();
+    let hierarchy = SessionTree::new(&app.rows);
+    let root = hierarchy.root(app.selected);
+    let family: Vec<_> = hierarchy.order.iter().copied().filter(|&(i, _)| hierarchy.root(i) == root).collect();
+    // Keep process information visible even for large families. The session
+    // window follows the selected row; j/k still reaches every family member.
+    // Reserve four lines for the shared-resource notice and process tree,
+    // plus the session heading, separator, and optional missing-parent note.
+    let capacity = height.saturating_sub(6 + usize::from(app.rows[root].subagent.is_some()));
+    if (family.len() > 1 || selected.subagent.is_some()) && capacity > 0 {
+        let count = family.len().min(capacity);
+        let selected_index = family.iter().position(|&(i, _)| i == app.selected).unwrap_or(0);
+        let start = selected_index.saturating_sub(count / 2).min(family.len() - count);
+        let heading = if count < family.len() {
+            format!("session tree ({}–{} of {})", start + 1, start + count, family.len())
+        } else {
+            "session tree".to_string()
+        };
+        lines.push(Line::styled(heading, Style::default().fg(ACCENT).bold()));
+        if let Some(info) = &app.rows[root].subagent {
+            lines.push(Line::styled(
+                truncate(&format!("parent {} not linked in this view", info.parent_session_id), width),
+                Style::default().fg(DIM),
+            ));
+        }
+        for &(i, depth) in &family[start..start + count] {
+            let a = &app.rows[i];
+            let branch = if depth == 0 { String::new() } else { format!("{}↳ ", "  ".repeat((depth - 1).min(width / 2))) };
+            let tag = if a.subagent.is_some() { "subagent" } else { "session" };
+            let identity = a.session_id.as_deref().unwrap_or("-");
+            let text = format!("{branch}[{tag}] {} · {} · {} tokens · {}", session_name(a), a.state.label(), tokens_cell(a), identity);
+            let style = if i == app.selected { Style::default().fg(ACCENT).bold() } else { Style::default().fg(DIM) };
+            lines.push(Line::styled(truncate(&text, width), style));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    let process = selected
+        .pid
+        .and_then(|pid| app.snapshot.agents.iter().find(|a| a.pid == Some(pid) && a.harness == selected.harness && a.tree.is_some()))
+        .unwrap_or(selected);
+    let shared = selected.shares_process
+        || (selected.pid.is_some()
+            && app.snapshot.agents.iter().filter(|a| a.pid == selected.pid && a.harness == selected.harness).count() > 1);
+    if shared {
+        lines.push(Line::styled("CPU/RSS shared by sessions", Style::default().fg(DIM)));
+    }
+    lines.extend(process_tree(selected, process, &app.snapshot.orphans, &app.snapshot.orphan_origins, app.snapshot.taken_at, width).lines);
+    Text::from(lines)
+}
+
+fn process_tree(
+    a: &Agent,
+    process: &Agent,
+    orphans: &[ProcNode],
+    origins: &[OrphanOrigin],
+    now: SystemTime,
+    width: usize,
+) -> Text<'static> {
     let mut lines = vec![Line::from(vec![
         Span::styled("process tree", Style::default().fg(ACCENT).bold()),
         Span::styled(
-            format!("   {} procs · {} mcp · cpu {:.1}% · rss {}", a.process_count, a.mcp_count, a.cpu_percent, bytes(a.rss_bytes)),
+            format!(
+                "   {} procs · {} mcp · cpu {:.1}% · rss {}",
+                process.process_count,
+                process.mcp_count,
+                process.cpu_percent,
+                bytes(process.rss_bytes)
+            ),
             Style::default().fg(DIM),
         ),
     ])];
-    match &a.tree {
+    match &process.tree {
         None if a.shares_process => {
             lines.push(Line::styled("  shares its process with another conversation; see the row that owns it", Style::default().fg(DIM)))
         }
@@ -1289,7 +1384,6 @@ fn render_node(n: &ProcNode, prefix: &str, last: bool, root: bool, width: usize,
     };
     let (tag, style) = match n.kind {
         ProcKind::Agent => ("agent", Style::default().fg(Color::Green).bold()),
-        ProcKind::Subagent => ("subagent", Style::default().fg(Color::Green)),
         ProcKind::Mcp => ("mcp", Style::default().fg(Color::Magenta).bold()),
         ProcKind::Shell => ("shell", Style::default().fg(Color::Blue)),
         ProcKind::Tool => ("tool", Style::default().fg(Color::White)),
@@ -1500,6 +1594,7 @@ mod tests {
             activity: agent_top_core::Activity::Working,
             pid: Some(4242),
             session_id: Some("a29e19c3".into()),
+            subagent: None,
             session_path: None,
             cwd: None,
             model: Some("claude-fable-5-1".into()),
@@ -1528,6 +1623,184 @@ mod tests {
             parse_warning: None,
             rate_limit: None,
         }
+    }
+
+    #[test]
+    fn old_process_subagents_render_as_agents() {
+        let node = ProcNode {
+            pid: 42,
+            ppid: Some(41),
+            name: "codex".into(),
+            cmdline: "codex exec review".into(),
+            kind: serde_json::from_str("\"subagent\"").unwrap(),
+            harness: Some(agent_top_core::Harness::Codex),
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            age_secs: 1,
+            cwd: None,
+            children: Vec::new(),
+        };
+        let mut lines = Vec::new();
+        render_node(&node, "", true, false, 120, &mut lines);
+        assert!(lines[0].to_string().contains("[agent]"));
+        assert!(!lines[0].to_string().contains("subagent"));
+        assert_eq!(serde_json::to_value(node.kind).unwrap(), "agent");
+    }
+
+    fn codex_family() -> Vec<Agent> {
+        let mut parent = agent("main", Vec::new());
+        parent.harness = agent_top_core::Harness::Codex;
+        parent.session_id = Some("session-main".into());
+        parent.id = "session-main".into();
+        parent.subagent_turns = 0;
+        parent.usage = TokenUsage { input: 100, ..Default::default() };
+        parent.rss_bytes = 256 << 20;
+        parent.process_count = 1;
+        parent.mcp_count = 0;
+        parent.tree = Some(ProcNode {
+            pid: 4242,
+            ppid: None,
+            name: "codex".into(),
+            cmdline: "codex --yolo".into(),
+            kind: ProcKind::Agent,
+            harness: Some(agent_top_core::Harness::Codex),
+            cpu_percent: 6.6,
+            rss_bytes: parent.rss_bytes,
+            age_secs: 60,
+            cwd: None,
+            children: Vec::new(),
+        });
+        let mut child = parent.clone();
+        child.id = "session-scout".into();
+        child.session_id = Some("session-scout".into());
+        child.usage.input = 200;
+        child.subagent = Some(agent_top_core::SubagentInfo {
+            parent_session_id: "session-main".into(),
+            nickname: Some("Scout".into()),
+            role: Some("explorer".into()),
+        });
+        child.shares_process = true;
+        child.rss_bytes = 0;
+        child.cpu_percent = 0.0;
+        child.process_count = 0;
+        child.tree = None;
+        let mut grandchild = child.clone();
+        grandchild.id = "session-review".into();
+        grandchild.session_id = Some("session-review".into());
+        grandchild.usage.input = 300;
+        grandchild.subagent = Some(agent_top_core::SubagentInfo {
+            parent_session_id: "session-scout".into(),
+            nickname: Some("Review".into()),
+            role: Some("reviewer".into()),
+        });
+        vec![grandchild, parent, child]
+    }
+
+    #[test]
+    fn explicit_session_tree_is_separate_from_shared_process_resources() {
+        let mut app = App::new(snapshot(codex_family()));
+        app.selected_id = Some("session-scout".into());
+        app.rebuild_rows();
+        assert_eq!(app.row_depths, vec![0, 1, 2]);
+        assert_eq!(table_session_name(&app.rows[1], 1), "↳ Scout (explorer)");
+        assert_eq!(table_session_name(&app.rows[2], 2), "  ↳ Review (reviewer)");
+        let selected = app.selected_agent().unwrap();
+        assert_eq!(mem_cell(selected), "·");
+        assert_eq!(cpu_cell(selected), "·");
+        let text = tree_detail(&app, selected, 120, 40).to_string();
+        assert!(text.contains("session tree"), "{text}");
+        assert!(text.contains("[session] main · running · 100 tokens"), "{text}");
+        assert!(text.contains("↳ [subagent] Scout (explorer) · running · 200 tokens"), "{text}");
+        assert!(text.contains("  ↳ [subagent] Review (reviewer) · running · 300 tokens"), "{text}");
+        let (sessions, processes) = text.split_once("CPU/RSS shared by sessions").unwrap();
+        assert!(!sessions.contains("rss"));
+        assert!(!sessions.contains("4242"), "logical sessions are not invented process nodes");
+        assert!(processes.contains("process tree"));
+        assert!(processes.contains("rss 256M"));
+        assert_eq!(processes.matches("[agent]").count(), 1, "show the owner's actual process tree once");
+        assert!(!processes.contains("[subagent"));
+        assert_eq!(app.snapshot.totals.tokens, 600);
+        assert_eq!(app.snapshot.totals.rss_bytes, 256 << 20);
+        let facts = agent_facts(selected, app.snapshot.taken_at).to_string();
+        assert!(facts.contains("parent     session-main"), "{facts}");
+        assert!(facts.contains("nickname   Scout"));
+        assert!(!facts.contains("(0 subagent)"));
+        let out = render(&mut app, 180, 48);
+        assert!(out.contains("↳ Scout (explorer)"), "{out}");
+        assert!(out.contains("Scout (explorer) · codex · running  [tree]"), "the detail title identifies the selected session: {out}");
+        assert!(out.contains("session tree"));
+        assert!(out.contains("process tree"));
+    }
+
+    #[test]
+    fn orphan_session_retains_metadata_and_hidden_owner_is_still_inspectable() {
+        let mut family = codex_family();
+        family.iter_mut().find(|a| a.id == "session-main").unwrap().state = AgentState::Stopped;
+        let mut app = App::new(snapshot(family));
+        app.show_stopped = false;
+        app.selected_id = Some("session-scout".into());
+        app.rebuild_rows();
+        assert_eq!(app.rows.len(), 2);
+        let selected = app.selected_agent().unwrap();
+        assert!(table_session_name(selected, 0).starts_with("[subagent]"));
+        let text = tree_detail(&app, selected, 120, 40).to_string();
+        assert!(text.contains("parent session-main not linked in this view"));
+        assert!(text.contains("rss 256M"), "the hidden resource-owner row remains inspectable: {text}");
+
+        app.snapshot.agents.retain(|a| a.id != "session-main");
+        app.rebuild_rows();
+        let text = tree_detail(&app, app.selected_agent().unwrap(), 120, 40).to_string();
+        assert!(text.contains("parent session-main not linked in this view"));
+        assert!(text.contains("shares its process"));
+        assert!(!text.contains("[agent]"), "do not fabricate a missing process tree");
+    }
+
+    #[test]
+    fn large_session_families_leave_room_for_the_process_tree() {
+        let mut family = codex_family();
+        let template = family.iter().find(|a| a.id == "session-scout").unwrap().clone();
+        for i in 0..20 {
+            let mut child = template.clone();
+            child.id = format!("extra-{i}");
+            child.session_id = Some(child.id.clone());
+            child.subagent.as_mut().unwrap().nickname = Some(format!("Worker-{i}"));
+            family.push(child);
+        }
+        let mut app = App::new(snapshot(family));
+        app.selected_id = Some("extra-19".into());
+        app.rebuild_rows();
+        for height in [8, 12, 20] {
+            let text = tree_detail(&app, app.selected_agent().unwrap(), 120, height).to_string();
+            let visible = text.lines().take(height).collect::<Vec<_>>().join("\n");
+            assert!(visible.contains("session tree ("), "indicate that the family is windowed: {visible}");
+            assert!(visible.contains("[subagent] Worker-19"), "keep the selected session in view: {visible}");
+            assert!(visible.contains("process tree"), "reserve room for process resources: {visible}");
+            assert!(visible.contains("[agent]"), "keep the real process visible: {visible}");
+        }
+    }
+
+    #[test]
+    fn session_hierarchy_survives_narrow_terminals() {
+        let mut app = App::new(snapshot(codex_family()));
+        app.selected_id = Some("session-review".into());
+        app.rebuild_rows();
+        for width in [0, 1, 8, 20, 40] {
+            let _ = tree_detail(&app, app.selected_agent().unwrap(), width, 40);
+        }
+        for (width, height) in [(20, 8), (40, 16), (80, 24)] {
+            let _ = render(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn no_lineage_keeps_the_existing_process_view() {
+        let app = App::new(snapshot(vec![agent("standalone", Vec::new())]));
+        let selected = app.selected_agent().unwrap();
+        assert_eq!(table_session_name(selected, 0), "standalone");
+        let text = tree_detail(&app, selected, 120, 40).to_string();
+        assert!(text.starts_with("process tree"));
+        assert!(!text.contains("session tree"));
+        assert!(!text.contains("CPU/RSS shared"));
     }
 
     fn snapshot(agents: Vec<Agent>) -> Snapshot {

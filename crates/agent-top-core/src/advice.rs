@@ -230,6 +230,7 @@ mod tests {
             activity: Activity::Working,
             pid: Some(1),
             session_id: None,
+            subagent: None,
             session_path: None,
             cwd: None,
             model: Some("claude-fable-5-1".into()),

@@ -37,8 +37,10 @@ later.
 
 **Discovery.** Walks the process table with `sysinfo` and identifies Claude
 Code, Codex, Gemini CLI, OpenCode, Aider, Copilot CLI and cursor-agent
-processes. Child processes are folded into a tree and labelled as subagents, MCP
-servers, shells or tools. An MCP server whose agent has exited is reported as an
+processes. Child processes are folded into a tree and labelled as agents, MCP
+servers, shells or tools. Codex logical subagents are identified separately from
+explicit transcript parent-session metadata, never from process ancestry.
+An MCP server whose agent has exited is reported as an
 orphan, which is a common way for these tools to leak memory.
 
 **Attribution.** Matches each process to its transcript file. Where a harness

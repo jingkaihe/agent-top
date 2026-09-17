@@ -54,6 +54,8 @@ impl ParseHealth {
 pub struct SessionSummary {
     pub harness: Option<Harness>,
     pub session_id: Option<String>,
+    /// Logical subagent metadata from the transcript, never from process ancestry.
+    pub subagent: Option<crate::model::SubagentInfo>,
     pub cwd: Option<PathBuf>,
     pub model: Option<String>,
     pub harness_version: Option<String>,
@@ -486,7 +488,7 @@ pub trait HarnessAdapter {
     /// of them is attributed. For work that must see every process at once:
     /// Codex reads which rollouts each process holds open here, so that no
     /// process's fallback can claim a thread another is demonstrably writing.
-    fn prepare(&mut self, _roots: &[&ProcNode]) {}
+    fn prepare(&mut self, _roots: &[&ProcNode], _by_pid: &std::collections::HashMap<u32, &RawProc>) {}
 
     /// The harness's own registry entry for a process, if it keeps one.
     fn hints(&self, _pid: u32) -> Option<RegistryHints> {

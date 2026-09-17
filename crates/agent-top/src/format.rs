@@ -3,6 +3,17 @@
 use agent_top_core::pricing::{Origin, Table};
 use agent_top_core::{Agent, AgentState, ProcNode, Snapshot};
 
+/// The same session identity is used for labels and name sorting.
+pub fn session_name(a: &Agent) -> String {
+    let Some(info) = &a.subagent else { return a.name.clone() };
+    match (&info.nickname, &info.role) {
+        (Some(name), Some(role)) => format!("{name} ({role})"),
+        (Some(name), None) => name.clone(),
+        (None, Some(role)) => format!("{} ({role})", a.name),
+        (None, None) => a.name.clone(),
+    }
+}
+
 /// CPU and memory belong to the process, and several conversations can share
 /// one. Showing 0.0% on the rows that do not own it would read as an idle
 /// agent rather than as "counted on the row above".

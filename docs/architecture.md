@@ -38,7 +38,11 @@ Once a second, the collector runs five steps and hands the front end a new snaps
 
 ### 1. Scan the processes
 
-`sysinfo` refreshes the process table, CPU and memory. Each process is classified: a harness root (`claude`, `codex`, `gemini`, `opencode`), or a child of one. Children are labelled `subagent`, `mcp`, `shell` or `tool` from their command line. An MCP-looking process with no agent ancestor becomes an **orphan**.
+`sysinfo` refreshes the process table, CPU and memory, excluding Linux worker threads: they share their process's memory and must not be counted as extra processes. Each process is classified: a harness root (`claude`, `codex`, `gemini`, `opencode`), or a child of one. Children are labelled `agent`, `mcp`, `shell` or `tool` from their command line. A nested harness is still an `agent`; process ancestry does not establish a logical subagent relationship. An MCP-looking process with no agent ancestor becomes an **orphan**. Legacy snapshot process kinds named `subagent` are read as `agent`.
+
+For Codex's npm install, the Node launcher and its native child are the same invocation, both labelled `agent`; both real PIDs contribute resources, but rollout ownership is read from the native child by matching the forwarded arguments. Explicit sandbox, execution, patch and management helpers are tools, not agents. Codex's native `spawn_agent` creates an in-process session: its actual parent is recorded in `session_meta.payload.source.subagent.thread_spawn.parent_thread_id`, or the explicit `thread_source: "subagent"` and `parent_thread_id` fields, not the OS process tree. `forked_from_id` is history ancestry and is not used as a subagent parent. These distinctions were checked against `openai/codex` tag `rust-v0.154.0` on 2026-09-17.
+
+The collector carries that relationship, plus the optional nickname and role, in each row's `subagent` metadata. The TUI groups these rows into a session hierarchy, separate from the process tree. Token and cost figures remain per rollout; nesting does not add a child's usage to its parent again. Shared process CPU and RSS are carried by one row, preferring a main session when available. No per-subagent memory estimate is made. A child whose parent is outside the snapshot or hidden remains visible without inventing a parent row.
 
 ### 2. Attribute each root to its transcript
 

@@ -32,7 +32,7 @@ One row per agent, or per conversation for a harness that hosts several in one p
 | PROCS, MCP | processes in the tree, and how many are MCP servers |
 | AGE | since the process started, or since the transcript began |
 
-`s` cycles the sort column and `r` reverses it. Stopped sessions stay visible for 30 minutes after their last write (`--stopped-window-min` changes that); `x` hides them.
+`s` cycles the sort column and `r` reverses it. Codex subagents with explicit parent-session metadata stay nested beneath their parent; sorting applies to roots and siblings, and each row remains selectable. Stopped sessions stay visible for 30 minutes after their last write (`--stopped-window-min` changes that); `x` hides them. If a parent is hidden or outside the snapshot, its visible children remain listed.
 
 ## The detail pane
 
@@ -40,16 +40,20 @@ The left column is the facts about the selected session: its id, working directo
 
 - **cost**, and which price table produced it.
 - **cache**: the share of the prompt served from cache, green when high and red when low. Every turn re-sends the conversation, and most of it can be billed at the cheap cache-read rate instead of full input price. A session at full price most turns is money left on the table.
-- **tokens**, **turns** (with the subagent's share) and **tool calls**.
+- **tokens**, **turns** (with folded subagent turns for harnesses that provide them) and **tool calls**. Codex rows retain their own usage rather than folding child sessions into the parent.
 - **breakdown**: each token class, the rate it was charged at, and what that came to.
 - **rate limit**, for harnesses that write one. Codex records a short window and a weekly one; each is shown with its use and its reset time, and a hit limit says so.
 - **export**: the exact `agent-top trace` command for this session.
 
 The right column has two views. `Tab` switches between them.
 
-### The process tree
+### Session and process trees
 
-The agent's process and everything under it: MCP servers, shells, the test run it started, a subagent. Each line has its pid, CPU, memory and age.
+For Codex sessions with recorded lineage, a **session tree** shows the parent and its `[subagent]` sessions, with their state and token usage. Nicknames and roles come from the transcript when available. These are logical sessions, so this tree does not assign each child a PID or separate memory figure. Selecting a child shows its own facts and trace.
+
+Large families show a window around the selected session, leaving room for the process tree below. Move through the table with `j`/`k` to inspect the rest; the session heading indicates the visible range.
+
+The separate **process tree** shows the agent's process and everything under it: MCP servers, shells, the test run it started, and any nested agent processes. Each line has its pid, CPU, memory and age. Nested harness processes are labelled `[agent]`, not assumed to be subagents. Linux worker threads are excluded. Sessions sharing a process refer to the same process tree, with its resources counted once, not once per session.
 
 Below it, **mcp servers** lists one row per server with its pid, calls, errors and last call. Calls are counted from the transcript; the process is matched to the server by name, or by elimination when one process and one server are left, in which case the pid carries a `?`. A server the transcript calls but no process owns is shown with no pid: an HTTP server, or one that has exited.
 
