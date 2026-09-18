@@ -49,9 +49,14 @@ answered it. So `prompt(n) − prompt(n−1)` is the new material; the previous
 reply's `output` is the part the model wrote itself; the remainder is the tool
 results submitted in between, and it is filed under the tools that produced
 them. When several results were answered by one response the growth is split
-evenly between them, which is a heuristic and the one place the figure is not
-exact. The first response's whole prompt, the replies, and any growth that no
-result explains (your own messages) go to one row, `prompts & replies`.
+evenly between them, so per-source figures are not exact. The first response's
+whole prompt, the replies, and any growth that no result explains (your own
+messages) go to one row, `prompts & replies`.
+
+**Codex code mode.** A wrapper with one recognised nested tool uses that tool's
+name when its timing fits entirely inside the wrapper. This link is a timing
+heuristic. Multiple, unknown or overlapping calls keep `exec` (or `wait`).
+Each wrapper output contributes once; nested completions do not add context tokens.
 
 **Cost.** Every response re-reads the whole context, so each source's tokens
 are charged at every response that read them, at that response's own prompt

@@ -2104,6 +2104,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_nested_tools_appear_in_tree_context() {
+        use agent_top_core::harness::{SessionTracker, codex::CodexTranscript};
+        let path = std::env::temp_dir().join(format!("agent-top-codex-context-ui-{}.jsonl", std::process::id()));
+        std::fs::write(&path, r#"{"timestamp":"1970-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper-1"}}
+{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1250,"completed_at_ms":1500,"item":{"type":"CommandExecution","id":"exec-command","source":"unified_exec_startup"}}}
+{"timestamp":"1970-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-1"}}
+{"timestamp":"1970-01-01T00:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper-2"}}
+{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":3250,"completed_at_ms":3500,"item":{"type":"FileChange","id":"exec-patch"}}}
+{"timestamp":"1970-01-01T00:00:04.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-2"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100}}}}
+"#).unwrap();
+        let mut transcript = CodexTranscript::new(&path);
+        transcript.refresh().unwrap();
+        let _ = std::fs::remove_file(path);
+        let mut a = agent("code-mode", Vec::new());
+        a.harness = agent_top_core::Harness::Codex;
+        a.price_source = None;
+        a.context = transcript.summary().context.sources();
+        let mut app = App::new(snapshot(vec![a]));
+        app.show_detail = true;
+        app.detail = DetailView::Tree;
+        let out = render(&mut app, 180, 48);
+        assert!(out.contains("context"), "{out}");
+        assert!(!out.contains("estimated"), "{out}");
+        for name in ["apply_patch", "exec_command"] {
+            assert!(out.lines().any(|l| l.contains(name) && l.contains("1      50        -")), "{out}");
+        }
+    }
+
+    #[test]
     fn detail_pane_shows_the_rate_limit() {
         use agent_top_core::{RateLimit, RateWindow};
         let mut a = agent("throttled", Vec::new());

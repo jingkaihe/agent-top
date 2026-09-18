@@ -42,6 +42,13 @@
 //! Live 0.154.0 rollouts (2026-09-17) can copy ancestor `session_meta` records
 //! after the child's own header when forking history. The first identified
 //! header owns this rollout's identity and lineage; later headers do not.
+//!
+//! Code mode (live/source verified on 0.154.0, 2026-09-18): `exec` wraps
+//! nested tools recorded as `event_msg/item_completed`, with `exec-<uuid>`
+//! ids and `started_at_ms`/`completed_at_ms`. Typed metadata supplies names;
+//! unknown types are ignored. Counts include wrappers and nested calls;
+//! context counts only wrapper outputs. A sole contained child's name is used
+//! as an estimate; ambiguous wrappers keep their name. No inputs/outputs are read.
 
 use super::{AttributeContext, HarnessAdapter, REFRESH_BUDGET_BYTES, SessionSummary, SessionTracker, SpanRetention, parse_rfc3339_utc};
 use crate::jsonl::TailReader;
@@ -308,9 +315,24 @@ pub struct CodexTranscript {
     inference: Option<String>,
     /// Tool calls awaiting their output, by call id, so the output can be
     /// filed under the call's name.
-    pending_tools: HashMap<String, String>,
+    pending_tools: HashMap<String, PendingTool>,
     /// The last per-response usage seen, to skip the repeated snapshot.
     last_response: Option<TokenUsage>,
+}
+
+struct PendingTool {
+    name: String,
+    started_at: SystemTime,
+    nested: Option<NestedSource>,
+    ambiguous: bool,
+    active: bool,
+}
+
+struct NestedSource {
+    id: String,
+    origin: ContextOrigin,
+    name: String,
+    ended_at: SystemTime,
 }
 
 impl CodexTranscript {
@@ -362,6 +384,60 @@ impl CodexTranscript {
     pub fn with_spans(mut self, retention: SpanRetention) -> Self {
         self.summary.spans = retention.log();
         self
+    }
+
+    /// Nested `exec-<uuid>` calls lack response_item pairs; direct calls already
+    /// have spans and must not be counted again.
+    fn nested_tool_completed(&mut self, payload: &Value) {
+        let Some(item) = payload.get("item") else { return };
+        let Some(id) = item.get("id").and_then(Value::as_str).filter(|id| id.starts_with("exec-") && id.len() > 5) else {
+            return;
+        };
+        if self.summary.spans.iter().any(|s| s.id == id) {
+            return;
+        }
+        let name = match item.get("type").and_then(Value::as_str) {
+            Some("CommandExecution") => match item.get("source").and_then(Value::as_str) {
+                Some("unified_exec_startup") => Some("exec_command"),
+                Some("unified_exec_interaction") => Some("write_stdin"),
+                _ => None,
+            },
+            Some("FileChange") => Some("apply_patch"),
+            Some("McpToolCall" | "DynamicToolCall") => item.get("tool").and_then(Value::as_str).filter(|s| !s.is_empty()),
+            _ => None,
+        };
+        let time =
+            |key| payload.get(key).and_then(Value::as_u64).and_then(|ms| SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms)));
+        let (start, end) = (time("started_at_ms"), time("completed_at_ms"));
+        let source = match (name, item.get("type").and_then(Value::as_str)) {
+            (Some(_), Some("McpToolCall")) => {
+                item.get("server").and_then(Value::as_str).filter(|s| !s.is_empty()).map(|server| (ContextOrigin::Mcp, server))
+            }
+            (Some(name), _) => Some((ContextOrigin::Tool, name)),
+            _ => None,
+        };
+        // Timing is a heuristic; keep ambiguous results under the wrapper.
+        for pending in self.pending_tools.values_mut().filter(|p| p.active && matches!(p.name.as_str(), "exec" | "wait")) {
+            if pending.nested.as_ref().is_some_and(|n| n.id == id) {
+                continue;
+            }
+            match (pending.nested.is_none(), source, start, end) {
+                (true, Some((origin, name)), Some(start), Some(end)) if start >= pending.started_at && end >= start => {
+                    pending.nested = Some(NestedSource { id: id.into(), origin, name: name.into(), ended_at: end });
+                }
+                _ => pending.ambiguous = true,
+            }
+        }
+        let (Some(name), Some(start), Some(end)) = (name, start, end) else { return };
+        if end < start {
+            return;
+        }
+        let error = matches!(item.get("status").and_then(Value::as_str), Some("failed" | "declined"))
+            || item.get("exit_code").and_then(Value::as_i64).is_some_and(|code| code != 0)
+            || item.get("success").and_then(Value::as_bool) == Some(false);
+        self.summary.tool_calls += 1;
+        self.summary.spans.open(id.to_string(), name.to_string(), start, false);
+        self.summary.spans.close(id, end, error);
     }
 
     fn ingest(&mut self, line: &str) {
@@ -459,6 +535,11 @@ impl CodexTranscript {
                     }
                 }
                 "user_message" => self.summary.activity = Activity::Working,
+                "item_completed" => {
+                    if let Some(p) = payload {
+                        self.nested_tool_completed(p);
+                    }
+                }
                 // An MCP tool call. Codex records the call as a `response_item`
                 // `function_call` too, which the block below counts as a tool
                 // call and turns into a span; this line is the only one that
@@ -491,6 +572,11 @@ impl CodexTranscript {
                     if let Some(id) = self.inference.take() {
                         self.summary.spans.discard_open(&id);
                     }
+                    // Keep names for late outputs, not overlap attribution.
+                    for pending in self.pending_tools.values_mut() {
+                        pending.active = false;
+                        pending.ambiguous = true;
+                    }
                 }
                 _ => {}
             },
@@ -501,7 +587,17 @@ impl CodexTranscript {
                         self.end_inference(ts);
                         let id = call_id(p);
                         let name = p.get("name").and_then(Value::as_str).unwrap_or(ptype);
-                        self.pending_tools.insert(id.clone(), name.to_string());
+                        let mut ambiguous = false;
+                        if matches!(name, "exec" | "wait") {
+                            for pending in
+                                self.pending_tools.values_mut().filter(|p| p.active && matches!(p.name.as_str(), "exec" | "wait"))
+                            {
+                                pending.ambiguous = true;
+                                ambiguous = true;
+                            }
+                        }
+                        self.pending_tools
+                            .insert(id.clone(), PendingTool { name: name.into(), started_at: ts, nested: None, ambiguous, active: true });
                         self.summary.spans.open(id, name.to_string(), ts, false);
                     }
                 }
@@ -512,8 +608,14 @@ impl CodexTranscript {
                         // is not distinguishable from a successful one here.
                         let id = call_id(p);
                         self.summary.spans.close(&id, ts, false);
-                        let name = self.pending_tools.remove(&id).unwrap_or_else(|| "tool".into());
-                        self.summary.context.result(&id, ContextOrigin::Tool, &name);
+                        let (origin, name) = match self.pending_tools.remove(&id) {
+                            Some(p) => match p.nested.filter(|n| !p.ambiguous && n.ended_at <= ts) {
+                                Some(n) => (n.origin, n.name),
+                                None => (ContextOrigin::Tool, p.name),
+                            },
+                            None => (ContextOrigin::Tool, "tool".into()),
+                        };
+                        self.summary.context.result(&id, origin, &name);
                         self.begin_inference(ts);
                     }
                 }
@@ -1029,5 +1131,234 @@ mod tests {
         assert_eq!(inf[0].duration_ms, Some(3_600));
         assert!(all.iter().all(|sp| sp.kind != SpanKind::Turn), "no task_started in this file");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn code_mode_records_nested_commands_and_patches_alongside_exec() {
+        // Sanitised 0.154.0 metadata; nested ids are independent of wrapper ids.
+        let path = std::env::temp_dir().join(format!("agent-top-codex-nested-{}.jsonl", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let mut t = CodexTranscript::new(&path);
+        for line in [
+            r#"{"timestamp":"2026-09-18T07:22:23.296Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_wrapper_1"}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:23.334Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1789716143334,"completed_at_ms":1789716143334,"item":{"type":"CommandExecution","id":"exec-command-1","source":"unified_exec_startup","status":"completed","exit_code":0}}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:23.348Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_wrapper_1"}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:30.281Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_wrapper_2"}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:30.288Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1789716150288,"completed_at_ms":1789716150288,"item":{"type":"FileChange","id":"exec-patch-1","status":"completed"}}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:30.351Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_wrapper_2"}}"#,
+        ] {
+            writeln!(f, "{line}").unwrap();
+            t.refresh().unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
+        let tools: Vec<_> = t.summary.spans.iter().filter(|s| s.kind == SpanKind::Tool).collect();
+        assert_eq!(t.summary.tool_calls, 4, "two wrapper invocations and two actual nested tool invocations");
+        assert_eq!(
+            tools.iter().map(|s| (s.name.as_str(), s.duration_ms)).collect::<Vec<_>>(),
+            [("exec", Some(52)), ("exec_command", Some(0)), ("exec", Some(70)), ("apply_patch", Some(0)),]
+        );
+        assert!(tools.iter().all(|s| !s.error));
+        assert!(t.pending_tools.is_empty(), "completion items do not leave unmatched response calls");
+        // Only wrapper outputs contribute to context accounting.
+        let usage = TokenUsage { input: 100, ..Default::default() };
+        let cost = crate::model::CostBreakdown { input: 1.0, ..Default::default() };
+        t.summary.context.response(&usage, &cost);
+        let sources = t.summary.context.sources();
+        for name in ["exec_command", "apply_patch"] {
+            let source = sources.iter().find(|s| s.name == name).unwrap();
+            assert_eq!((source.calls, source.tokens), (1, 50));
+        }
+        assert!(!sources.iter().any(|s| s.name == "exec"));
+
+        let mut baseline = crate::harness::ContextLedger::default();
+        baseline.result("call_wrapper_1", ContextOrigin::Tool, "exec");
+        baseline.result("call_wrapper_2", ContextOrigin::Tool, "exec");
+        baseline.response(&usage, &cost);
+        for input in [150, 180] {
+            let usage = TokenUsage { input, ..Default::default() };
+            t.summary.context.response(&usage, &cost);
+            baseline.response(&usage, &cost);
+            let totals = |ledger: &crate::harness::ContextLedger| {
+                ledger
+                    .sources()
+                    .iter()
+                    .fold((0, 0, 0.0), |(calls, tokens, cost), s| (calls + s.calls, tokens + s.tokens, cost + s.cost_usd))
+            };
+            let (calls, tokens, cost) = totals(&t.summary.context);
+            let (old_calls, old_tokens, old_cost) = totals(&baseline);
+            assert_eq!((calls, tokens), (old_calls, old_tokens));
+            assert!((cost - old_cost).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn code_mode_context_keeps_ambiguous_wrappers_and_survives_span_eviction() {
+        use serde_json::json;
+        let child = |id, kind, start, end| {
+            json!({
+                "item":{"id":id,"type":kind}, "started_at_ms":start, "completed_at_ms":end,
+            })
+        };
+        let patch = child("exec-patch", "FileChange", Some(1250), Some(1500));
+        let unknown = child("exec-unknown", "FutureTool", Some(1250), Some(1500));
+        for (children, expected) in [
+            (vec![patch.clone()], "apply_patch"),
+            (vec![patch.clone(), patch.clone()], "apply_patch"),
+            (vec![patch.clone(), child("exec-patch-2", "FileChange", Some(1500), Some(1750))], "exec"),
+            (vec![patch.clone(), unknown.clone()], "exec"),
+            (vec![unknown, patch], "exec"),
+            (vec![child("exec-patch", "FileChange", Some(500), Some(1500))], "exec"),
+            (vec![child("exec-patch", "FileChange", Some(1250), Some(2500))], "exec"),
+            (vec![child("exec-patch", "FileChange", None, Some(1500))], "exec"),
+            (vec![child("exec-patch", "FileChange", Some(1250), None)], "exec"),
+            (vec![], "exec"),
+        ] {
+            let mut t = CodexTranscript::new("unused.jsonl");
+            t.ingest(r#"{"timestamp":"1970-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper"}}"#);
+            for completion in children {
+                t.nested_tool_completed(&completion);
+            }
+            for i in 0..t.summary.spans.cap() {
+                t.summary.spans.open(format!("filler-{i}"), "tool".into(), SystemTime::UNIX_EPOCH, false);
+            }
+            t.ingest(r#"{"timestamp":"1970-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper"}}"#);
+            t.summary.context.response(&TokenUsage { input: 100, ..Default::default() }, &Default::default());
+            let sources = t.summary.context.sources();
+            assert_eq!(sources.len(), 1);
+            assert_eq!((sources[0].name.as_str(), sources[0].calls, sources[0].tokens), (expected, 1, 100));
+        }
+    }
+
+    #[test]
+    fn code_mode_context_rejects_overlapping_exec_and_wait_but_not_wait_agent() {
+        use serde_json::json;
+        for other in ["exec", "wait", "wait_agent"] {
+            for exec_first in [true, false] {
+                let mut t = CodexTranscript::new("unused.jsonl");
+                for (id, name) in [("wrapper", "exec"), ("other", other)] {
+                    t.ingest(
+                        &json!({"timestamp":"1970-01-01T00:00:01.000Z", "type":"response_item",
+                        "payload":{"type":"function_call","name":name,"call_id":id}})
+                        .to_string(),
+                    );
+                }
+                t.nested_tool_completed(&json!({"started_at_ms":1250,"completed_at_ms":1500,
+                    "item":{"id":"exec-patch","type":"FileChange"}}));
+                for id in if exec_first { ["wrapper", "other"] } else { ["other", "wrapper"] } {
+                    t.ingest(
+                        &json!({"timestamp":"1970-01-01T00:00:02.000Z", "type":"response_item",
+                        "payload":{"type":"function_call_output","call_id":id}})
+                        .to_string(),
+                    );
+                }
+                t.summary.context.response(&TokenUsage { input: 100, ..Default::default() }, &Default::default());
+                let sources = t.summary.context.sources();
+                assert_eq!(sources.iter().any(|s| s.name == "apply_patch"), other == "wait_agent");
+                assert_eq!(sources.iter().map(|s| s.calls).sum::<u64>(), 2);
+                assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 100);
+            }
+        }
+    }
+
+    #[test]
+    fn unfinished_wrappers_do_not_block_context_attribution_in_later_turns() {
+        use serde_json::json;
+        for ending in ["task_complete", "turn_aborted", "error"] {
+            let mut t = CodexTranscript::new("unused.jsonl");
+            for line in [
+                json!({"timestamp":"1970-01-01T00:00:01.000Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call","name":"exec","call_id":"old"}}),
+                json!({"timestamp":"1970-01-01T00:00:02.000Z","type":"event_msg","payload":{"type":ending}}),
+                json!({"timestamp":"1970-01-01T00:00:03.000Z","type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"timestamp":"1970-01-01T00:00:03.100Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call","name":"exec","call_id":"new"}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","started_at_ms":3200,"completed_at_ms":3500,
+                    "item":{"type":"FileChange","id":"exec-patch"}}}),
+                json!({"timestamp":"1970-01-01T00:00:04.000Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call_output","call_id":"new"}}),
+                json!({"timestamp":"1970-01-01T00:00:05.000Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call_output","call_id":"old"}}),
+            ] {
+                t.ingest(&line.to_string());
+            }
+            t.summary.context.response(&TokenUsage { input: 100, ..Default::default() }, &Default::default());
+            let sources = t.summary.context.sources();
+            assert_eq!(sources.len(), 2);
+            for name in ["apply_patch", "exec"] {
+                let source = sources.iter().find(|s| s.name == name).unwrap();
+                assert_eq!((source.calls, source.tokens), (1, 50));
+            }
+        }
+    }
+
+    #[test]
+    fn code_mode_completion_metadata_preserves_timing_names_and_errors() {
+        use serde_json::json;
+        let mut t = CodexTranscript::new("unused.jsonl");
+        for (item, name, error) in [
+            (json!({"type":"CommandExecution","source":"unified_exec_startup","exit_code":1}), "exec_command", true),
+            (json!({"type":"CommandExecution","source":"unified_exec_interaction","status":"completed"}), "write_stdin", false),
+            (json!({"type":"FileChange","status":"declined"}), "apply_patch", true),
+            (json!({"type":"McpToolCall","tool":"search","status":"failed"}), "search", true),
+            (json!({"type":"DynamicToolCall","tool":"lookup","success":false}), "lookup", true),
+        ] {
+            let mut item = item;
+            item["id"] = json!(format!("exec-{name}"));
+            let line = json!({
+                "type":"event_msg", "timestamp":"2026-09-18T07:22:25.000Z",
+                "payload":{"type":"item_completed", "started_at_ms":1000, "completed_at_ms":1250, "item":item},
+            })
+            .to_string();
+            let before = t.summary.tool_calls;
+            t.ingest(&line);
+            let span = t.summary.spans.iter().next_back().unwrap();
+            assert_eq!((span.name.as_str(), span.duration_ms, span.error), (name, Some(250), error));
+            assert_eq!(span.started_at, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+            // Replayed completions must not count twice.
+            t.ingest(&line);
+            assert_eq!(t.summary.tool_calls, before + 1);
+        }
+        assert_eq!(t.summary.tool_calls, 5);
+        assert_eq!(t.summary.spans.len(), 5);
+        assert!(t.inference.is_none(), "nested results are not new model requests");
+    }
+
+    #[test]
+    fn completion_items_do_not_duplicate_direct_calls_or_guess_unknown_tools() {
+        use serde_json::json;
+        let mut t = CodexTranscript::new("unused.jsonl");
+        t.ingest(r#"{"timestamp":"2026-09-18T07:22:23.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_direct"}}"#);
+        for item in [
+            json!({"type":"CommandExecution","id":"call_direct","source":"unified_exec_startup"}),
+            json!({"type":"FileChange","id":"call_patch"}),
+            json!({"type":"CommandExecution","id":"exec-user","source":"user_shell"}),
+            json!({"type":"CommandExecution","id":"exec-unknown","source":"new_source"}),
+            json!({"type":"UnknownTool","id":"exec-future"}),
+            json!({"type":"DynamicToolCall","id":"exec-missing-name"}),
+            json!({"type":"McpToolCall","id":"exec-empty-name","tool":""}),
+            json!({"type":"FileChange","id":"exec-"}),
+            json!({"type":"FileChange"}),
+        ] {
+            t.ingest(
+                &json!({
+                    "type":"event_msg", "payload":{"type":"item_completed", "started_at_ms":1000, "completed_at_ms":1250, "item":item},
+                })
+                .to_string(),
+            );
+        }
+        for (start, end) in [(json!(null), json!(1250)), (json!(1000), json!(null)), (json!(1250), json!(1000))] {
+            t.ingest(
+                &json!({
+                    "type":"event_msg", "payload":{"type":"item_completed", "started_at_ms":start, "completed_at_ms":end,
+                        "item":{"type":"FileChange","id":"exec-no-timing"}},
+                })
+                .to_string(),
+            );
+        }
+        t.ingest(r#"{"timestamp":"2026-09-18T07:22:24.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_direct"}}"#);
+        assert_eq!(t.summary.tool_calls, 1);
+        let tools: Vec<_> = t.summary.spans.iter().filter(|s| s.kind == SpanKind::Tool).collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].duration_ms, Some(1000));
     }
 }
