@@ -4,6 +4,10 @@ Each `.jsonl` here is a real transcript from the harness and version in its
 filename, reduced to the fields `agent-top` actually reads. Everything else was
 dropped rather than masked, which is the only reliable way not to leak a prompt:
 no message text, no tool inputs, no tool output, no real paths or session ids.
+The one field that cannot simply be dropped is the output text of a tool nested
+in a Codex code-mode call, because the parser measures its byte length. In
+`codex-code-mode-0.154.jsonl` each such string is replaced by `x` repeated to
+the original byte length, so the lengths are real and the text is gone.
 The scripts that produced them are not checked in because they are not meant to
 be re-run against someone else's machine; regenerate by hand if a new harness
 version needs covering, then audit the result before committing it.
