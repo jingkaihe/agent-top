@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-18
+
+### Highlights
+Codex subagents now appear as what they are: sessions inside their parent's process. Each one nests under its parent in the table with its nickname and role, keeps its own tokens and cost, and shares one process tree, so memory is counted once.
+
+Codex code mode is opened up. A session that used to show 28 rows of `exec` now shows the commands and patches that ran inside them, in the trace and in context by source.
+
 ### Added
 - Codex: subagent sessions nest under their parent in the table and in `--once`, named by nickname and role. `--json` gains `subagent` (`parent_session_id`, `nickname`, `role`) per agent. ([#44](https://github.com/kannandreams/agent-top/pull/44))
 - Codex: tools run inside a code-mode `exec` call, such as `exec_command` and `apply_patch`, appear in the trace, the tool-call count and context by source. ([#44](https://github.com/kannandreams/agent-top/pull/44))
