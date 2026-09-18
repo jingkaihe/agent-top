@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- Codex: subagent sessions nest under their parent in the table and in `--once`, named by nickname and role. `--json` gains `subagent` (`parent_session_id`, `nickname`, `role`) per agent. ([#44](https://github.com/kannandreams/agent-top/pull/44))
+- Codex: tools run inside a code-mode `exec` call, such as `exec_command` and `apply_patch`, appear in the trace, the tool-call count and context by source. ([#44](https://github.com/kannandreams/agent-top/pull/44))
+- Catppuccin Mocha and Latte themes, chosen from the terminal's background colour. ([#43](https://github.com/kannandreams/agent-top/pull/43))
+
+### Changed
+- Codex: a code-mode call's context share is divided between its nested tools by the length of each tool's output. Only the length is taken; no output text is kept. ([#44](https://github.com/kannandreams/agent-top/pull/44))
+- A nested agent process is labelled `agent` in the process tree and in `--json`; the `subagent` process kind is gone. Older snapshots still load. ([#44](https://github.com/kannandreams/agent-top/pull/44))
+- `agent-top-core`: `ProcKind::Subagent` is removed, `HarnessAdapter::prepare` takes the process map, and `Agent` and `SessionSummary` gain `subagent`. ([#44](https://github.com/kannandreams/agent-top/pull/44))
+
+### Fixed
+- Linux: worker threads were counted as child processes, which multiplied an agent's memory and process count and showed threads as subagents. ([#44](https://github.com/kannandreams/agent-top/pull/44))
+- Codex: on recent versions, context by source sized each tool result from the wrong response and charged typed messages to tools. ([#44](https://github.com/kannandreams/agent-top/pull/44))
+- Codex installed through npm is matched to its transcript by the open rollout file instead of by working directory. ([#44](https://github.com/kannandreams/agent-top/pull/44))
+- Codex helper processes such as `codex mcp` and the sandbox are no longer listed as agents. ([#44](https://github.com/kannandreams/agent-top/pull/44))
+
 ## [0.18.1] - 2026-09-16
 
 ### Security
