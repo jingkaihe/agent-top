@@ -109,8 +109,8 @@ impl McpUsage {
 /// that answered it. So `prompt_n - prompt_n-1` is the new material, the
 /// previous reply's `output` is the part of it the model wrote itself, and
 /// the rest is the tool results submitted in between. Those tokens go to
-/// the tools that produced them, split evenly when several were answered
-/// together, which is a heuristic and is labelled as one in the UI. The
+/// the tools that produced them, split evenly across result records. Each
+/// record may split its share by nested tools' byte weights, a heuristic. The
 /// first response's whole prompt, the replies, and any growth with no
 /// result to explain it (the user's own messages) are `Other`.
 ///
@@ -132,12 +132,15 @@ pub struct ContextLedger {
     live: BTreeMap<ContextKey, u64>,
     /// Results submitted since the last response, by call id, awaiting the
     /// response that will say how big they were.
-    pending: Vec<(String, ContextKey)>,
+    pending: Vec<(String, ContextWeights)>,
     /// The last response's prompt and output, for the next delta.
     prev: Option<(u64, u64)>,
 }
 
 type ContextKey = (ContextOrigin, String);
+
+/// Per-call byte weights within one result record, not across records.
+pub(super) type ContextWeights = Vec<(ContextOrigin, String, u64)>;
 
 /// One source's running totals.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -159,14 +162,25 @@ impl ContextLedger {
     /// id, so a harness that names the MCP server only after the result is
     /// written can `retag` it before the response arrives.
     pub fn result(&mut self, id: &str, origin: ContextOrigin, name: &str) {
-        self.pending.push((id.to_string(), (origin, name.to_string())));
+        self.result_weighted(id, vec![(origin, name.to_string(), 1)]);
+    }
+
+    /// Split one result's share by weight; all-zero weights split equally.
+    /// Callers resolve missing weights. Empty groups are ignored.
+    pub(super) fn result_weighted(&mut self, id: &str, sources: ContextWeights) {
+        if !sources.is_empty() {
+            self.pending.push((id.to_string(), sources));
+        }
     }
 
     /// Re-file a pending result under another source. A no-op once the
     /// response that sized it has been seen.
     pub fn retag(&mut self, id: &str, origin: ContextOrigin, name: &str) {
-        if let Some((_, key)) = self.pending.iter_mut().find(|(i, _)| i == id) {
-            *key = (origin, name.to_string());
+        if let Some((_, sources)) = self.pending.iter_mut().find(|(i, _)| i == id) {
+            for (source_origin, source_name, _) in sources {
+                *source_origin = origin;
+                *source_name = name.to_string();
+            }
         }
     }
 
@@ -209,9 +223,9 @@ impl ContextLedger {
         self.prev = Some((prompt, usage.output));
     }
 
-    /// `results` tokens across the pending results, evenly; `other` tokens
-    /// to `Other`. No pending result puts everything under `Other`.
-    fn file(&mut self, results: u64, other: u64, pending: Vec<(String, ContextKey)>) {
+    /// Split evenly across records, then by weight within each record.
+    /// No pending result puts everything under `Other`.
+    fn file(&mut self, results: u64, other: u64, pending: Vec<(String, ContextWeights)>) {
         if pending.is_empty() {
             self.add(Self::other(), results + other, 0);
             return;
@@ -219,10 +233,29 @@ impl ContextLedger {
         self.add(Self::other(), other, 0);
         let n = pending.len() as u64;
         let (each, mut rem) = (results / n, results % n);
-        for (_, key) in pending {
+        for (_, sources) in pending {
             let t = each + u64::from(rem > 0);
             rem = rem.saturating_sub(1);
-            self.add(key, t, 1);
+            let total: u128 = sources.iter().map(|(_, _, weight)| u128::from(*weight)).sum();
+            let denominator = if total == 0 { sources.len() as u128 } else { total };
+            let mut remaining = t;
+            let mut parts: Vec<_> = sources
+                .into_iter()
+                .map(|(origin, name, weight)| {
+                    let weight = if total == 0 { 1 } else { u128::from(weight) };
+                    let numerator = u128::from(t) * weight;
+                    let tokens = (numerator / denominator) as u64;
+                    remaining -= tokens;
+                    ((origin, name), tokens, numerator % denominator)
+                })
+                .collect();
+            // Largest remainders first; stable ties follow contribution order.
+            parts.sort_by_key(|part| std::cmp::Reverse(part.2));
+            for (key, tokens, _) in parts {
+                let tokens = tokens + u64::from(remaining > 0);
+                remaining = remaining.saturating_sub(1);
+                self.add(key, tokens, 1);
+            }
         }
     }
 
@@ -786,6 +819,117 @@ mod tests {
         let total: f64 = v.iter().map(|s| s.cost_usd).sum();
         assert!((total - 4_300e-6).abs() < 1e-12, "{total}");
         assert_eq!(v[0].tokens, 1_100, "largest first");
+    }
+
+    #[test]
+    fn context_ledger_weights_preserve_equal_shares_between_result_records() {
+        let mut l = ContextLedger::default();
+        l.response(&usage(1_000, 100), &cost(1_000));
+        l.result_weighted("wrapper", vec![(ContextOrigin::Tool, "exec_command".into(), 1), (ContextOrigin::Tool, "apply_patch".into(), 3)]);
+        l.result("direct", ContextOrigin::Mcp, "fs");
+        l.response(&usage(3_100, 0), &cost(3_100));
+        let v = l.sources();
+        assert_eq!(share(&v, "exec_command").tokens, 250);
+        assert_eq!(share(&v, "apply_patch").tokens, 750);
+        assert_eq!(share(&v, "fs").tokens, 1_000);
+        assert_eq!(v.iter().map(|s| s.calls).sum::<u64>(), 3);
+        assert_eq!(v.iter().map(|s| s.tokens).sum::<u64>(), 3_100);
+        assert!((v.iter().map(|s| s.cost_usd).sum::<f64>() - 4_100e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn context_ledger_weighted_rounding_handles_zero_and_equal_weights() {
+        for (weights, tokens, expected) in [
+            ([0, 0, 0], 2, [1, 1, 0]),
+            ([1, 1, 1], 2, [1, 1, 0]), // Caller-resolved missing weights.
+            ([0, 1, 3], 1, [0, 0, 1]),
+            ([0, 1, 3], 2, [0, 1, 1]),
+            ([0, 1, 3], 0, [0, 0, 0]),
+        ] {
+            let mut l = ContextLedger::default();
+            l.response(&usage(100, 0), &cost(100));
+            l.result_weighted("wrapper", weights.into_iter().enumerate().map(|(i, w)| (ContextOrigin::Tool, i.to_string(), w)).collect());
+            l.response(&usage(100 + tokens, 0), &cost(100 + tokens));
+            let v = l.sources();
+            for (i, tokens) in expected.into_iter().enumerate() {
+                let source = share(&v, &i.to_string());
+                assert_eq!((source.calls, source.tokens), (1, tokens), "weights: {weights:?}");
+            }
+            assert_eq!(v.iter().map(|s| s.tokens).sum::<u64>(), 100 + tokens);
+            assert!((v.iter().map(|s| s.cost_usd).sum::<f64>() - (200 + tokens) as f64 / 1e6).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn context_ledger_weighted_empty_groups_do_not_lose_tokens() {
+        let mut l = ContextLedger::default();
+        l.result_weighted("empty", Vec::new());
+        l.response(&usage(100, 0), &cost(100));
+        assert_eq!(share(&l.sources(), ContextLedger::OTHER).tokens, 100);
+        l.result_weighted("empty", Vec::new());
+        l.result("direct", ContextOrigin::Tool, "Read");
+        l.response(&usage(200, 0), &cost(200));
+        let v = l.sources();
+        assert_eq!((share(&v, "Read").calls, share(&v, "Read").tokens), (1, 100));
+        assert_eq!(v.iter().map(|s| s.tokens).sum::<u64>(), 200);
+    }
+
+    #[test]
+    fn context_ledger_weights_aggregate_repeated_names_and_survive_retagging() {
+        let mut l = ContextLedger::default();
+        l.response(&usage(100, 0), &cost(100));
+        let sources = vec![(ContextOrigin::Tool, "Read".into(), 1), (ContextOrigin::Tool, "Read".into(), 3)];
+        l.result_weighted("first", sources.clone());
+        l.response(&usage(140, 0), &cost(140));
+        assert_eq!((share(&l.sources(), "Read").calls, share(&l.sources(), "Read").tokens), (2, 40));
+        l.result_weighted("second", sources);
+        l.retag("second", ContextOrigin::Mcp, "fs");
+        assert_eq!(l.pending[0].1, vec![(ContextOrigin::Mcp, "fs".into(), 1), (ContextOrigin::Mcp, "fs".into(), 3)]);
+        l.response(&usage(180, 0), &cost(180));
+        let v = l.sources();
+        assert_eq!((share(&v, "fs").calls, share(&v, "fs").tokens), (2, 40));
+        assert_eq!(share(&v, "fs").origin, ContextOrigin::Mcp);
+        assert_eq!((share(&v, "Read").calls, share(&v, "Read").tokens), (2, 40));
+        assert_eq!(v.iter().map(|s| s.tokens).sum::<u64>(), 180);
+    }
+
+    #[test]
+    fn context_ledger_weights_use_wide_products_and_sums() {
+        let mut l = ContextLedger::default();
+        l.result_weighted("wrapper", vec![(ContextOrigin::Tool, "a".into(), u64::MAX), (ContextOrigin::Tool, "b".into(), u64::MAX - 1)]);
+        l.response(&usage(u64::MAX, 0), &cost(u64::MAX));
+        let v = l.sources();
+        assert_eq!(share(&v, "a").tokens, u64::MAX / 2 + 1);
+        assert_eq!(share(&v, "b").tokens, u64::MAX / 2);
+        assert_eq!(v.iter().map(|s| s.tokens).sum::<u64>(), u64::MAX);
+        assert_eq!(v.iter().map(|s| s.calls).sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn context_ledger_weighted_costs_conserve_totals_across_rereads_and_compaction() {
+        let mut l = ContextLedger::default();
+        l.response(&usage(1_000, 100), &cost(1_000));
+        l.result_weighted("wrapper", vec![(ContextOrigin::Tool, "exec_command".into(), 1), (ContextOrigin::Tool, "apply_patch".into(), 3)]);
+        l.response(&usage(1_500, 50), &cost(1_500));
+        let v = l.sources();
+        assert_eq!(share(&v, "exec_command").tokens, 100);
+        assert_eq!(share(&v, "apply_patch").tokens, 300);
+        l.response(&usage(1_550, 10), &cost(1_550));
+        let v = l.sources();
+        assert!((share(&v, "exec_command").cost_usd - 200e-6).abs() < 1e-12);
+        assert!((share(&v, "apply_patch").cost_usd - 600e-6).abs() < 1e-12);
+        assert!((v.iter().map(|s| s.cost_usd).sum::<f64>() - 4_050e-6).abs() < 1e-12);
+
+        l.response(&usage(500, 10), &cost(500)); // Implicit compaction.
+        l.response(&usage(510, 0), &cost(510));
+        l.compacted();
+        l.response(&usage(700, 0), &cost(700));
+        let v = l.sources();
+        assert!((share(&v, "exec_command").cost_usd - 200e-6).abs() < 1e-12);
+        assert!((share(&v, "apply_patch").cost_usd - 600e-6).abs() < 1e-12);
+        assert_eq!(v.iter().map(|s| s.calls).sum::<u64>(), 2);
+        assert_eq!(v.iter().map(|s| s.tokens).sum::<u64>(), 2_760);
+        assert!((v.iter().map(|s| s.cost_usd).sum::<f64>() - 5_760e-6).abs() < 1e-12);
     }
 
     #[test]

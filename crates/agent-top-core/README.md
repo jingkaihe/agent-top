@@ -66,8 +66,9 @@ keeps the newest 128 spans; to read a whole transcript, open it with
 `refresh_all`, which is what `agent-top trace` does.
 
 Everything is read only and stays on the machine. The library makes no network
-calls, never signals or writes to an agent, and reads metadata fields only,
-never the content of prompts or tool output.
+calls and never signals or writes to an agent. It reads metadata and measures
+Codex nested-tool output text for relative byte weights, retaining only sizes.
+Prompts and tool inputs are not inspected; output text is never retained or exported.
 
 ## Stability
 

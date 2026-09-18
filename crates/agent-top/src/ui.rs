@@ -2108,13 +2108,10 @@ mod tests {
         use agent_top_core::harness::{SessionTracker, codex::CodexTranscript};
         let path = std::env::temp_dir().join(format!("agent-top-codex-context-ui-{}.jsonl", std::process::id()));
         std::fs::write(&path, r#"{"timestamp":"1970-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper-1"}}
-{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1250,"completed_at_ms":1500,"item":{"type":"CommandExecution","id":"exec-command","source":"unified_exec_startup"}}}
+{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1250,"completed_at_ms":1500,"item":{"type":"CommandExecution","id":"exec-command","source":"unified_exec_startup","formatted_output":"abc"}}}
+{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1600,"completed_at_ms":1700,"item":{"type":"FileChange","id":"exec-patch","stdout":"d"}}}
 {"timestamp":"1970-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-1"}}
 {"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000}}}}
-{"timestamp":"1970-01-01T00:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper-2"}}
-{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":3250,"completed_at_ms":3500,"item":{"type":"FileChange","id":"exec-patch"}}}
-{"timestamp":"1970-01-01T00:00:04.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-2"}}
-{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1050}}}}
 {"timestamp":"1970-01-01T00:00:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
 {"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1100}}}}
 "#).unwrap();
@@ -2131,8 +2128,8 @@ mod tests {
         let out = render(&mut app, 180, 48);
         assert!(out.contains("context"), "{out}");
         assert!(!out.contains("estimated"), "{out}");
-        for name in ["apply_patch", "exec_command"] {
-            assert!(out.lines().any(|l| l.contains(name) && l.contains("1      50        -")), "{out}");
+        for (name, values) in [("apply_patch", "1      25        -"), ("exec_command", "1      75        -")] {
+            assert!(out.lines().any(|l| l.contains(name) && l.contains(values)), "{out}");
         }
     }
 

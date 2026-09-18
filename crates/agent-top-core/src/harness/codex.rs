@@ -49,10 +49,14 @@
 //! nested tools recorded as `event_msg/item_completed`, with `exec-<uuid>`
 //! ids and `started_at_ms`/`completed_at_ms`. Typed metadata supplies names;
 //! unknown types are ignored. Counts include wrappers and nested calls;
-//! context counts only wrapper outputs. A sole contained child's name is used
-//! as an estimate; ambiguous wrappers keep their name. No inputs/outputs are read.
+//! each wrapper's context share is split between its contained children by
+//! output-text bytes (evenly if sizes are unavailable). Only sizes are retained;
+//! no prompts or inputs are inspected. Ambiguous wrappers keep their name.
 
-use super::{AttributeContext, HarnessAdapter, REFRESH_BUDGET_BYTES, SessionSummary, SessionTracker, SpanRetention, parse_rfc3339_utc};
+use super::{
+    AttributeContext, ContextWeights, HarnessAdapter, REFRESH_BUDGET_BYTES, SessionSummary, SessionTracker, SpanRetention,
+    parse_rfc3339_utc,
+};
 use crate::jsonl::TailReader;
 use crate::model::{Activity, Attribution, ContextOrigin, Harness, ProcNode, SpanKind, SubagentInfo, TokenUsage};
 use crate::pricing::{self, Table};
@@ -319,7 +323,7 @@ pub struct CodexTranscript {
     /// filed under the call's name.
     pending_tools: HashMap<String, PendingTool>,
     /// Completed results awaiting the next model response.
-    context_results: Vec<(String, ContextOrigin, String)>,
+    context_results: Vec<(String, ContextWeights)>,
     response_in_progress: bool,
     /// Per-response and cumulative usage, to skip repeated snapshots.
     last_response: Option<(TokenUsage, Option<TokenUsage>)>,
@@ -328,7 +332,7 @@ pub struct CodexTranscript {
 struct PendingTool {
     name: String,
     started_at: SystemTime,
-    nested: Option<NestedSource>,
+    nested: Vec<NestedSource>,
     ambiguous: bool,
     active: bool,
 }
@@ -338,6 +342,39 @@ struct NestedSource {
     origin: ContextOrigin,
     name: String,
     ended_at: SystemTime,
+    output_bytes: Option<u64>,
+}
+
+/// Measure decoded output text, never command arguments or patch contents.
+fn nested_output_bytes(item: &Value) -> Option<u64> {
+    let text = |key| item.get(key).and_then(Value::as_str).map(|s| s.len() as u64);
+    let streams = || match (text("stdout"), text("stderr")) {
+        (None, None) => None,
+        (out, err) => Some(out.unwrap_or(0) + err.unwrap_or(0)),
+    };
+    match item.get("type").and_then(Value::as_str)? {
+        "CommandExecution" => text("formatted_output").or_else(|| text("aggregated_output")).or_else(streams),
+        "FileChange" => streams(),
+        "McpToolCall" => match item.get("result").filter(|v| !v.is_null()) {
+            Some(result) if result.get("structuredContent").is_some_and(|v| !v.is_null()) => None,
+            Some(result) => text_content_bytes(result.get("content")?, "text"),
+            None => item.pointer("/error/message").and_then(Value::as_str).map(|s| s.len() as u64),
+        },
+        "DynamicToolCall" => match item.get("content_items").filter(|v| !v.is_null()) {
+            Some(content) => text_content_bytes(content, "inputText"),
+            None => text("error"),
+        },
+        _ => None,
+    }
+}
+
+fn text_content_bytes(content: &Value, kind: &str) -> Option<u64> {
+    content.as_array()?.iter().try_fold(0, |total, item| {
+        if item.get("type").and_then(Value::as_str) != Some(kind) {
+            return None;
+        }
+        Some(total + item.get("text")?.as_str()?.len() as u64)
+    })
 }
 
 impl CodexTranscript {
@@ -400,7 +437,7 @@ impl CodexTranscript {
         let Some(id) = item.get("id").and_then(Value::as_str).filter(|id| id.starts_with("exec-") && id.len() > 5) else {
             return;
         };
-        if self.summary.spans.iter().any(|s| s.id == id) {
+        if self.summary.spans.iter().any(|s| s.id == id) || self.pending_tools.values().any(|p| p.nested.iter().any(|n| n.id == id)) {
             return;
         }
         let name = match item.get("type").and_then(Value::as_str) {
@@ -425,12 +462,15 @@ impl CodexTranscript {
         };
         // Timing is a heuristic; keep ambiguous results under the wrapper.
         for pending in self.pending_tools.values_mut().filter(|p| p.active && matches!(p.name.as_str(), "exec" | "wait")) {
-            if pending.nested.as_ref().is_some_and(|n| n.id == id) {
-                continue;
-            }
-            match (pending.nested.is_none(), source, start, end) {
-                (true, Some((origin, name)), Some(start), Some(end)) if start >= pending.started_at && end >= start => {
-                    pending.nested = Some(NestedSource { id: id.into(), origin, name: name.into(), ended_at: end });
+            match (source, start, end) {
+                (Some((origin, name)), Some(start), Some(end)) if start >= pending.started_at && end >= start => {
+                    pending.nested.push(NestedSource {
+                        id: id.into(),
+                        origin,
+                        name: name.into(),
+                        ended_at: end,
+                        output_bytes: nested_output_bytes(item),
+                    });
                 }
                 _ => pending.ambiguous = true,
             }
@@ -466,8 +506,8 @@ impl CodexTranscript {
                 "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call" | "web_search_call" | "reasoning"
             ) || (ptype == "message" && payload.and_then(|p| p.get("role")).and_then(Value::as_str) == Some("assistant")))
         {
-            for (id, origin, name) in self.context_results.drain(..) {
-                self.summary.context.result(&id, origin, &name);
+            for (id, sources) in self.context_results.drain(..) {
+                self.summary.context.result_weighted(&id, sources);
             }
             self.response_in_progress = true;
         }
@@ -584,9 +624,11 @@ impl CodexTranscript {
                         u.errors += u64::from(error);
                         u.last_call = u.last_call.max(ts);
                         let id = payload.map(call_id).unwrap_or_default();
-                        if let Some((_, origin, name)) = self.context_results.iter_mut().find(|(i, _, _)| *i == id) {
-                            *origin = ContextOrigin::Mcp;
-                            *name = server.to_string();
+                        if let Some((_, sources)) = self.context_results.iter_mut().find(|(i, _)| *i == id) {
+                            for (origin, name, _) in sources {
+                                *origin = ContextOrigin::Mcp;
+                                *name = server.to_string();
+                            }
                         }
                         self.summary.context.retag(&id, ContextOrigin::Mcp, server);
                     }
@@ -624,26 +666,30 @@ impl CodexTranscript {
                                 ambiguous = true;
                             }
                         }
-                        self.pending_tools
-                            .insert(id.clone(), PendingTool { name: name.into(), started_at: ts, nested: None, ambiguous, active: true });
+                        self.pending_tools.insert(
+                            id.clone(),
+                            PendingTool { name: name.into(), started_at: ts, nested: Vec::new(), ambiguous, active: true },
+                        );
                         self.summary.spans.open(id, name.to_string(), ts, false);
                     }
                 }
                 "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
                     if let (Some(ts), Some(p)) = (ts, payload) {
-                        // Codex reports the result as an opaque string, and
-                        // agent-top does not read tool output, so a failed call
-                        // is not distinguishable from a successful one here.
+                        // Wrapper output text is opaque; errors need typed metadata.
                         let id = call_id(p);
                         self.summary.spans.close(&id, ts, false);
-                        let (origin, name) = match self.pending_tools.remove(&id) {
-                            Some(p) => match p.nested.filter(|n| !p.ambiguous && n.ended_at <= ts) {
-                                Some(n) => (n.origin, n.name),
-                                None => (ContextOrigin::Tool, p.name),
-                            },
-                            None => (ContextOrigin::Tool, "tool".into()),
+                        let sources = match self.pending_tools.remove(&id) {
+                            Some(p) if !p.ambiguous && !p.nested.is_empty() && p.nested.iter().all(|n| n.ended_at <= ts) => {
+                                let sized = p.nested.iter().all(|n| n.output_bytes.is_some());
+                                p.nested
+                                    .into_iter()
+                                    .map(|n| (n.origin, n.name, if sized { n.output_bytes.unwrap_or(0) } else { 1 }))
+                                    .collect()
+                            }
+                            Some(p) => vec![(ContextOrigin::Tool, p.name, 1)],
+                            None => vec![(ContextOrigin::Tool, "tool".into(), 1)],
                         };
-                        self.context_results.push((id, origin, name));
+                        self.context_results.push((id, sources));
                         self.begin_inference(ts);
                     }
                 }
@@ -1341,6 +1387,110 @@ mod tests {
     }
 
     #[test]
+    fn nested_output_sizes_use_decoded_text_not_inputs_or_duplicate_fields() {
+        use serde_json::json;
+        for (item, expected) in [
+            (
+                json!({"type":"CommandExecution","formatted_output":"é\n", "aggregated_output":"longer output", "stdout":"duplicate"}),
+                Some(3),
+            ),
+            (json!({"type":"CommandExecution","aggregated_output":"abcd","stdout":"duplicate","stderr":"duplicate"}), Some(4)),
+            (json!({"type":"CommandExecution","stdout":"ab","stderr":"c"}), Some(3)),
+            (json!({"type":"CommandExecution","command":["must not size this"]}), None),
+            (json!({"type":"FileChange","stdout":"ok\n","stderr":"!","changes":{"file":"not output"}}), Some(4)),
+            (json!({"type":"FileChange","stdout":"","stderr":""}), Some(0)),
+            (json!({"type":"FileChange","changes":{"file":"not output"}}), None),
+            (json!({"type":"McpToolCall","result":{"content":[{"type":"text","text":"abc"},{"type":"text","text":"d"}]}}), Some(4)),
+            (json!({"type":"McpToolCall","result":{"content":[{"type":"image","data":"not text"}]}}), None),
+            (json!({"type":"McpToolCall","result":{"content":[],"structuredContent":{"large":"result"}}}), None),
+            (json!({"type":"McpToolCall","error":{"message":"failed"}}), Some(6)),
+            (json!({"type":"DynamicToolCall","content_items":[{"type":"inputText","text":"abc"}],"arguments":"not output"}), Some(3)),
+            (json!({"type":"DynamicToolCall","content_items":[{"type":"inputImage","imageUrl":"not text"}]}), None),
+            (json!({"type":"DynamicToolCall","content_items":[{"type":"inputText","text":42}]}), None),
+            (json!({"type":"DynamicToolCall","error":"failed"}), Some(6)),
+        ] {
+            assert_eq!(nested_output_bytes(&item), expected, "{item}");
+        }
+    }
+
+    #[test]
+    fn code_mode_context_weights_children_without_changing_wrapper_totals() {
+        use serde_json::json;
+        for wrapper in ["exec", "wait"] {
+            for (command, patch, expected) in [
+                (Some("abc"), Some("d"), (30, 10)),
+                (Some("abc"), None, (20, 20)),
+                (None, Some("d"), (20, 20)),
+                (Some(""), Some(""), (20, 20)),
+                (Some(""), Some("d"), (0, 40)),
+            ] {
+                let mut t = CodexTranscript::new("unused.jsonl").with_prices(pricing::builtin_table());
+                t.ingest(r#"{"type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#);
+                t.ingest(
+                    &json!({"timestamp":"1970-01-01T00:00:01Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call","name":wrapper,"call_id":"wrapper"}})
+                    .to_string(),
+                );
+                for (item, start, end) in [
+                    (
+                        json!({"type":"CommandExecution","id":"exec-command","source":"unified_exec_startup","formatted_output":command}),
+                        1100,
+                        1200,
+                    ),
+                    (json!({"type":"FileChange","id":"exec-patch","stdout":patch}), 1300, 1400),
+                ] {
+                    let line = json!({"type":"event_msg","payload":{"type":"item_completed","item":item,
+                        "started_at_ms":start,"completed_at_ms":end}})
+                    .to_string();
+                    t.ingest(&line);
+                    t.ingest(&line);
+                }
+                t.ingest(r#"{"timestamp":"1970-01-01T00:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper"}}"#);
+                record_response(&mut t, 1_000, 0, 10);
+                assert_eq!(t.summary.context.sources().len(), 1);
+                t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+                let snapshot = record_response(&mut t, 1_050, 1_000, 10);
+                t.ingest(&snapshot);
+                let sources = t.summary.context.sources();
+                let command = sources.iter().find(|s| s.name == "exec_command").unwrap();
+                let patch = sources.iter().find(|s| s.name == "apply_patch").unwrap();
+                assert_eq!((command.tokens, patch.tokens), expected);
+                assert_eq!((command.calls, patch.calls, t.summary.tool_calls), (1, 1, 3));
+                assert!(!sources.iter().any(|s| s.name == wrapper));
+                assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 1_050);
+                let prompt_cost = t.summary.cost_breakdown.input + t.summary.cost_breakdown.cache_read;
+                assert!((sources.iter().map(|s| s.cost_usd).sum::<f64>() - prompt_cost).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn code_mode_context_weights_mcp_and_dynamic_results_and_preserves_errors() {
+        use serde_json::json;
+        let mut t = CodexTranscript::new("unused.jsonl");
+        t.ingest(r#"{"timestamp":"1970-01-01T00:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper"}}"#);
+        for item in [
+            json!({"id":"exec-mcp","type":"McpToolCall","tool":"lookup","server":"docs","result":{"content":[{"type":"text","text":"abc"}]}}),
+            json!({"id":"exec-dynamic","type":"DynamicToolCall","tool":"check","success":false,"content_items":[{"type":"inputText","text":"d"}]}),
+        ] {
+            t.ingest(
+                &json!({"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1100,"completed_at_ms":1500,"item":item}})
+                    .to_string(),
+            );
+        }
+        t.ingest(r#"{"timestamp":"1970-01-01T00:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper"}}"#);
+        record_response(&mut t, 1_000, 0, 0);
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        record_response(&mut t, 1_040, 0, 0);
+        let sources = t.summary.context.sources();
+        let mcp = sources.iter().find(|s| s.name == "docs").unwrap();
+        let dynamic = sources.iter().find(|s| s.name == "check").unwrap();
+        assert_eq!((mcp.origin, mcp.calls, mcp.tokens), (ContextOrigin::Mcp, 1, 30));
+        assert_eq!((dynamic.origin, dynamic.calls, dynamic.tokens), (ContextOrigin::Tool, 1, 10));
+        assert!(t.summary.spans.iter().any(|s| s.name == "check" && s.error));
+    }
+
+    #[test]
     fn code_mode_context_keeps_ambiguous_wrappers_and_survives_span_eviction() {
         use serde_json::json;
         let child = |id, kind, start, end| {
@@ -1350,17 +1500,17 @@ mod tests {
         };
         let patch = child("exec-patch", "FileChange", Some(1250), Some(1500));
         let unknown = child("exec-unknown", "FutureTool", Some(1250), Some(1500));
-        for (children, expected) in [
-            (vec![patch.clone()], "apply_patch"),
-            (vec![patch.clone(), patch.clone()], "apply_patch"),
-            (vec![patch.clone(), child("exec-patch-2", "FileChange", Some(1500), Some(1750))], "exec"),
-            (vec![patch.clone(), unknown.clone()], "exec"),
-            (vec![unknown, patch], "exec"),
-            (vec![child("exec-patch", "FileChange", Some(500), Some(1500))], "exec"),
-            (vec![child("exec-patch", "FileChange", Some(1250), Some(2500))], "exec"),
-            (vec![child("exec-patch", "FileChange", None, Some(1500))], "exec"),
-            (vec![child("exec-patch", "FileChange", Some(1250), None)], "exec"),
-            (vec![], "exec"),
+        for (children, expected, calls) in [
+            (vec![patch.clone()], "apply_patch", 1),
+            (vec![patch.clone(), patch.clone()], "apply_patch", 1),
+            (vec![patch.clone(), child("exec-patch-2", "FileChange", Some(1500), Some(1750))], "apply_patch", 2),
+            (vec![patch.clone(), unknown.clone()], "exec", 1),
+            (vec![unknown, patch], "exec", 1),
+            (vec![child("exec-patch", "FileChange", Some(500), Some(1500))], "exec", 1),
+            (vec![child("exec-patch", "FileChange", Some(1250), Some(2500))], "exec", 1),
+            (vec![child("exec-patch", "FileChange", None, Some(1500))], "exec", 1),
+            (vec![child("exec-patch", "FileChange", Some(1250), None)], "exec", 1),
+            (vec![], "exec", 1),
         ] {
             let mut t = CodexTranscript::new("unused.jsonl");
             t.ingest(r#"{"timestamp":"1970-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper"}}"#);
@@ -1370,13 +1520,18 @@ mod tests {
             for i in 0..t.summary.spans.cap() {
                 t.summary.spans.open(format!("filler-{i}"), "tool".into(), SystemTime::UNIX_EPOCH, false);
             }
+            if t.pending_tools["wrapper"].nested.iter().any(|n| n.id == "exec-patch") {
+                let before = t.summary.tool_calls;
+                t.nested_tool_completed(&child("exec-patch", "FileChange", Some(1250), Some(1500)));
+                assert_eq!(t.summary.tool_calls, before);
+            }
             t.ingest(r#"{"timestamp":"1970-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper"}}"#);
             record_response(&mut t, 1_000, 0, 0);
             t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
             record_response(&mut t, 1_100, 0, 0);
             let sources: Vec<_> = t.summary.context.sources().into_iter().filter(|s| s.origin != ContextOrigin::Other).collect();
             assert_eq!(sources.len(), 1);
-            assert_eq!((sources[0].name.as_str(), sources[0].calls, sources[0].tokens), (expected, 1, 100));
+            assert_eq!((sources[0].name.as_str(), sources[0].calls, sources[0].tokens), (expected, calls, 100));
         }
     }
 

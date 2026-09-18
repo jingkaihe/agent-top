@@ -24,9 +24,10 @@ about which ones are exact and which are inferred.
   a platform where it cannot, the match falls back to working directory and
   start time, and the detail pane labels that row a heuristic rather than
   presenting it as fact.
-- **Only metadata is read.** Token counts, model ids, tool names, timestamps.
-  Never a prompt, a tool input, or a tool result. Even the size of a tool
-  result is inferred from how much the next prompt grew, not read from it
+- **Metadata and output sizes only.** Token counts, model ids, tool names,
+  timestamps, and local byte lengths of Codex nested-tool output text.
+  Prompts and tool inputs are not inspected. Output text is measured, never
+  retained or exported; only numeric weights survive parsing
   (see [Context by source](#context-by-source)).
 - **Your data never leaves the machine.** `agent-top` never kills or writes to an
   agent, and it never sends your sessions, prompts, costs or process list
@@ -40,8 +41,9 @@ about which ones are exact and which are inferred.
 ## Context by source
 
 The detail pane's `context` section says what each tool's results added to the
-prompt and what carrying that has cost. It is derived, not read: no harness
-records the size of a tool result, and agent-top does not read the result.
+prompt and what carrying that has cost. Token sizes are derived from usage
+records, not counted from result text. Codex nested-tool output sizes provide
+relative weights, not additional tokens.
 
 **Tokens.** A response's prompt is the previous response's prompt plus
 everything appended since: the previous reply, and the tool results that
@@ -58,13 +60,23 @@ of the response that requested them. Those results wait for the following,
 consuming response; they do not receive the initial prompt's tokens. Repeated
 usage snapshots do not consume queued results or add cost.
 
-**Codex code mode.** A wrapper with one recognised nested tool uses that tool's
-name when its timing fits entirely inside the wrapper. This link is a timing
-heuristic. Multiple, unknown or overlapping calls keep `exec` (or `wait`).
-Each wrapper output contributes once; nested completions do not add context tokens.
-Child output bytes or tokenizer counts cannot reliably split a wrapper that
-filters, combines or discards those outputs. No result bodies are inspected
-for weighting.
+**Codex code mode.** Recognised nested tools whose timing fits entirely inside
+one wrapper share that wrapper's allocation. This link is a timing heuristic;
+unknown calls, invalid timing or overlapping wrappers keep `exec` (or `wait`).
+Each wrapper output contributes once, regardless of its number of children.
+
+Children are weighted by decoded UTF-8 output-text bytes: formatted command
+output (falling back to aggregate output or stdout/stderr), patch stdout/stderr,
+and text-only MCP or dynamic-tool results. Arguments, patch diffs, JSON envelope
+keys and duplicate output fields do not contribute. If any size is unavailable
+(including structured or non-text results), or all outputs are empty, children
+split evenly. Rounding preserves the wrapper's exact allocation; the `calls`
+column counts the nested calls, not an additional wrapper call.
+
+This is a heuristic, not exact per-tool token usage. A wrapper can filter,
+combine or discard child output, and byte lengths are not tokenizer counts.
+No output text is retained or exported, and session token and cost totals are
+unchanged.
 
 **Cost.** Every response re-reads the whole context, so each source's tokens
 are charged at every response that read them, at that response's own prompt

@@ -124,8 +124,9 @@ The tokens are the growth of the prompt between one response and the next,
 attributed to the tool results submitted in between (split evenly when several
 were answered together, which is a heuristic); the cost is those tokens at each
 later response's own prompt rate, mostly the cache-read price. The rows sum to
-the session's prompt-side cost. Nothing is read from a tool result itself,
-only how much bigger the next prompt was. See
+the session's prompt-side cost. Codex code-mode wrappers divide their share
+between nested tools using output-text byte lengths, falling back to an even
+split when sizes are unavailable. Only sizes are retained, not output text. See
 [accounting.md](docs/accounting.md#context-by-source) for the arithmetic and
 its limits. `agent-top --once` lists the top sources per agent under
 `CONTEXT BY SOURCE`; `--json` carries them all as `context`.
@@ -485,8 +486,9 @@ which are exact and which are inferred. In short:
   shown as a floor, never guessed at.
 - **Attribution says how sure it is** — exact from a registry or an open file,
   or labelled a heuristic when it falls back to working directory and start time.
-- **Only metadata is read**, and **nothing is written, signalled, or sent** (bar
-  the one `--endpoint` you type).
+- **Only metadata and Codex nested-output sizes are used**; no prompt or tool
+  input is inspected and no output text retained. **Nothing is written,
+  signalled, or sent** (bar the one `--endpoint` you type).
 
 The full account, including a worked example of why agent-top and your harness
 can disagree on cost and how to reconcile them, is
