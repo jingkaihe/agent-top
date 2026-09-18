@@ -69,7 +69,7 @@ impl DetailView {
 /// A session forest built only from explicit transcript lineage. Input order
 /// determines root/sibling order; PIDs and working directories are irrelevant.
 pub(crate) struct SessionTree {
-    pub parents: Vec<Option<usize>>,
+    /// Row index and depth, parents before their children.
     pub order: Vec<(usize, usize)>,
 }
 
@@ -130,14 +130,7 @@ impl SessionTree {
             order.push((i, depth));
             pending.extend(children[i].iter().rev().map(|&child| (child, depth + 1)));
         }
-        Self { parents, order }
-    }
-
-    pub fn root(&self, mut index: usize) -> usize {
-        while let Some(parent) = self.parents[index] {
-            index = parent;
-        }
-        index
+        Self { order }
     }
 }
 
@@ -814,7 +807,6 @@ mod tests {
         let agents = vec![other_harness, session("child", Some("parent"), 0), session("parent", None, 0), session("unrelated", None, 0)];
         assert!(agents.iter().all(|a| a.pid == Some(1)), "the fixture deliberately shares a PID");
         let hierarchy = SessionTree::new(&agents);
-        assert_eq!(hierarchy.parents, vec![None, Some(2), None, None]);
         assert_eq!(hierarchy.order, vec![(0, 0), (2, 0), (1, 1), (3, 0)]);
     }
 
@@ -834,11 +826,10 @@ mod tests {
         let mut indexes: Vec<_> = hierarchy.order.iter().map(|&(i, _)| i).collect();
         indexes.sort_unstable();
         assert_eq!(indexes, (0..agents.len()).collect::<Vec<_>>());
-        assert_eq!(hierarchy.parents[2], None);
-        assert_eq!(hierarchy.parents[5], None, "never choose an arbitrary duplicate parent");
-        for i in 0..agents.len() {
-            assert!(hierarchy.root(i) < agents.len(), "cycle traversal must terminate");
-        }
+        let depth = |i| hierarchy.order.iter().find(|&&(row, _)| row == i).unwrap().1;
+        assert_eq!(depth(2), 0, "a session is not its own parent");
+        assert_eq!(depth(5), 0, "never choose an arbitrary duplicate parent");
+        assert!(depth(0) == 0 || depth(1) == 0, "a cycle is broken, not followed");
     }
 
     /// The question opens once when a newer version is known, not when that

@@ -1,9 +1,9 @@
 //! Rendering. Layout, top to bottom: header (host gauges + totals), agent
 //! table, optional detail pane (process tree + token breakdown), key bar.
 
-use crate::app::{App, DetailView, Overlay, Panel, SessionTree};
+use crate::app::{App, DetailView, Overlay, Panel};
 use crate::format::{
-    age, bytes, cost, cpu_cell, duration_ms, mem_cell, session_name, short_cmd, short_model, tokens, tokens_cell, truncate,
+    age, bytes, cost, cpu_cell, duration_ms, mem_cell, nested_name, session_name, short_cmd, short_model, tokens, tokens_cell, truncate,
 };
 use crate::theme::{Ramp, Theme};
 use agent_top_core::{Agent, AgentState, Attribution, McpMatch, OrphanOrigin, ProcKind, ProcNode, SpanKind, ToolSpan};
@@ -739,7 +739,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let [left, right] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(inner);
     f.render_widget(Paragraph::new(agent_facts(a, app.snapshot.taken_at, theme)).wrap(Wrap { trim: false }), left);
     let panel = match app.detail {
-        DetailView::Tree => tree_detail(app, a, right.width as usize, right.height as usize, theme),
+        DetailView::Tree => tree_detail(app, a, right.width as usize, theme),
         DetailView::Trace => tool_trace(a, app.snapshot.taken_at, right.width as usize, right.height as usize, theme),
     };
     f.render_widget(Paragraph::new(panel), right);
@@ -750,15 +750,7 @@ fn kv<'a>(k: &'a str, v: String, theme: &Theme) -> Line<'a> {
 }
 
 fn table_session_name(a: &Agent, depth: usize) -> String {
-    let prefix = if depth > 0 {
-        format!("{}↳ ", "  ".repeat(depth.saturating_sub(1).min(8)))
-    } else if a.subagent.is_some() {
-        // Its parent may be missing, ambiguous or hidden by the stopped filter.
-        "[subagent] ".into()
-    } else {
-        String::new()
-    };
-    truncate(&format!("{prefix}{}", session_name(a)), 26)
+    nested_name(a, depth, 26)
 }
 
 /// One line of the cost breakdown: tokens, the price they were charged at,
@@ -1126,46 +1118,10 @@ fn busy_ms(shown: &[&ToolSpan], now: SystemTime) -> u64 {
     total.as_millis() as u64
 }
 
-/// Session lineage and OS ancestry are deliberately separate sections. The
-/// first has per-session usage, while all CPU/RSS comes from the process owner.
-fn tree_detail(app: &App, selected: &Agent, width: usize, height: usize, theme: &Theme) -> Text<'static> {
+/// The process tree of the selected row. Sessions that share a process show
+/// the tree of the row that owns it; the table carries the session hierarchy.
+fn tree_detail(app: &App, selected: &Agent, width: usize, theme: &Theme) -> Text<'static> {
     let mut lines = Vec::new();
-    let hierarchy = SessionTree::new(&app.rows);
-    let root = hierarchy.root(app.selected);
-    let family: Vec<_> = hierarchy.order.iter().copied().filter(|&(i, _)| hierarchy.root(i) == root).collect();
-    // Keep process information visible even for large families. The session
-    // window follows the selected row; j/k still reaches every family member.
-    // Reserve four lines for the shared-resource notice and process tree,
-    // plus the session heading, separator, and optional missing-parent note.
-    let capacity = height.saturating_sub(6 + usize::from(app.rows[root].subagent.is_some()));
-    if (family.len() > 1 || selected.subagent.is_some()) && capacity > 0 {
-        let count = family.len().min(capacity);
-        let selected_index = family.iter().position(|&(i, _)| i == app.selected).unwrap_or(0);
-        let start = selected_index.saturating_sub(count / 2).min(family.len() - count);
-        let heading = if count < family.len() {
-            format!("session tree ({}–{} of {})", start + 1, start + count, family.len())
-        } else {
-            "session tree".to_string()
-        };
-        lines.push(Line::styled(heading, Style::default().fg(theme.accent).bold()));
-        if let Some(info) = &app.rows[root].subagent {
-            lines.push(Line::styled(
-                truncate(&format!("parent {} not linked in this view", info.parent_session_id), width),
-                Style::default().fg(theme.dim),
-            ));
-        }
-        for &(i, depth) in &family[start..start + count] {
-            let a = &app.rows[i];
-            let branch = if depth == 0 { String::new() } else { format!("{}↳ ", "  ".repeat((depth - 1).min(width / 2))) };
-            let tag = if a.subagent.is_some() { "subagent" } else { "session" };
-            let identity = a.session_id.as_deref().unwrap_or("-");
-            let text = format!("{branch}[{tag}] {} · {} · {} tokens · {}", session_name(a), a.state.label(), tokens_cell(a), identity);
-            let style = if i == app.selected { Style::default().fg(theme.accent).bold() } else { Style::default().fg(theme.dim) };
-            lines.push(Line::styled(truncate(&text, width), style));
-        }
-        lines.push(Line::raw(""));
-    }
-
     let process = selected
         .pid
         .and_then(|pid| app.snapshot.agents.iter().find(|a| a.pid == Some(pid) && a.harness == selected.harness && a.tree.is_some()))
@@ -1643,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_session_tree_is_separate_from_shared_process_resources() {
+    fn subagent_rows_nest_in_the_table_and_share_the_owners_process_tree() {
         let mut app = App::new(snapshot(codex_family()));
         app.selected_id = Some("session-scout".into());
         app.rebuild_rows();
@@ -1654,14 +1610,10 @@ mod tests {
         assert_eq!(mem_cell(selected), "·");
         assert_eq!(cpu_cell(selected), "·");
         let theme = Theme::new(ThemeMode::Dark, true);
-        let text = tree_detail(&app, selected, 120, 40, &theme).to_string();
-        assert!(text.contains("session tree"), "{text}");
-        assert!(text.contains("[session] main · running · 100 tokens"), "{text}");
-        assert!(text.contains("↳ [subagent] Scout (explorer) · running · 200 tokens"), "{text}");
-        assert!(text.contains("  ↳ [subagent] Review (reviewer) · running · 300 tokens"), "{text}");
-        let (sessions, processes) = text.split_once("CPU/RSS shared by sessions").unwrap();
-        assert!(!sessions.contains("rss"));
-        assert!(!sessions.contains("4242"), "logical sessions are not invented process nodes");
+        let text = tree_detail(&app, selected, 120, &theme).to_string();
+        assert!(!text.contains("session tree"), "the table carries the hierarchy: {text}");
+        let (before, processes) = text.split_once("CPU/RSS shared by sessions").unwrap();
+        assert!(before.is_empty(), "{text}");
         assert!(processes.contains("process tree"));
         assert!(processes.contains("rss 256M"));
         assert_eq!(processes.matches("[agent]").count(), 1, "show the owner's actual process tree once");
@@ -1675,7 +1627,6 @@ mod tests {
         let out = render(&mut app, 180, 48);
         assert!(out.contains("↳ Scout (explorer)"), "{out}");
         assert!(out.contains("Scout (explorer) · codex · running  [tree]"), "the detail title identifies the selected session: {out}");
-        assert!(out.contains("session tree"));
         assert!(out.contains("process tree"));
     }
 
@@ -1691,41 +1642,30 @@ mod tests {
         let selected = app.selected_agent().unwrap();
         assert!(table_session_name(selected, 0).starts_with("[subagent]"));
         let theme = Theme::new(ThemeMode::Dark, true);
-        let text = tree_detail(&app, selected, 120, 40, &theme).to_string();
-        assert!(text.contains("parent session-main not linked in this view"));
+        let text = tree_detail(&app, selected, 120, &theme).to_string();
         assert!(text.contains("rss 256M"), "the hidden resource-owner row remains inspectable: {text}");
+        let facts = agent_facts(selected, app.snapshot.taken_at, &theme).to_string();
+        assert!(facts.contains("parent     session-main"), "the facts still name the hidden parent: {facts}");
 
         app.snapshot.agents.retain(|a| a.id != "session-main");
         app.rebuild_rows();
-        let text = tree_detail(&app, app.selected_agent().unwrap(), 120, 40, &theme).to_string();
-        assert!(text.contains("parent session-main not linked in this view"));
+        let text = tree_detail(&app, app.selected_agent().unwrap(), 120, &theme).to_string();
         assert!(text.contains("shares its process"));
         assert!(!text.contains("[agent]"), "do not fabricate a missing process tree");
     }
 
+    /// `--once` names and nests subagent rows the way the live table does;
+    /// without it a parent and its children print the same name.
     #[test]
-    fn large_session_families_leave_room_for_the_process_tree() {
+    fn the_plain_table_names_and_nests_subagent_rows() {
+        let out = crate::format::plain_table(&snapshot(codex_family()));
+        let names: Vec<&str> = out.lines().skip(1).take(3).map(|l| l[..l.find(" codex").unwrap()].trim_end()).collect();
+        assert_eq!(names, ["main", "↳ Scout (explorer)", "  ↳ Review (reviewer)"], "{out}");
+
         let mut family = codex_family();
-        let template = family.iter().find(|a| a.id == "session-scout").unwrap().clone();
-        for i in 0..20 {
-            let mut child = template.clone();
-            child.id = format!("extra-{i}");
-            child.session_id = Some(child.id.clone());
-            child.subagent.as_mut().unwrap().nickname = Some(format!("Worker-{i}"));
-            family.push(child);
-        }
-        let mut app = App::new(snapshot(family));
-        app.selected_id = Some("extra-19".into());
-        app.rebuild_rows();
-        let theme = Theme::new(ThemeMode::Dark, true);
-        for height in [8, 12, 20] {
-            let text = tree_detail(&app, app.selected_agent().unwrap(), 120, height, &theme).to_string();
-            let visible = text.lines().take(height).collect::<Vec<_>>().join("\n");
-            assert!(visible.contains("session tree ("), "indicate that the family is windowed: {visible}");
-            assert!(visible.contains("[subagent] Worker-19"), "keep the selected session in view: {visible}");
-            assert!(visible.contains("process tree"), "reserve room for process resources: {visible}");
-            assert!(visible.contains("[agent]"), "keep the real process visible: {visible}");
-        }
+        family.retain(|a| a.id != "session-main");
+        let out = crate::format::plain_table(&snapshot(family));
+        assert!(out.lines().nth(1).unwrap().starts_with("[subagent] Scout"), "a row whose parent is not listed says so: {out}");
     }
 
     #[test]
@@ -1735,7 +1675,7 @@ mod tests {
         app.rebuild_rows();
         let theme = Theme::new(ThemeMode::Dark, true);
         for width in [0, 1, 8, 20, 40] {
-            let _ = tree_detail(&app, app.selected_agent().unwrap(), width, 40, &theme);
+            let _ = tree_detail(&app, app.selected_agent().unwrap(), width, &theme);
         }
         for (width, height) in [(20, 8), (40, 16), (80, 24)] {
             let _ = render(&mut app, width, height);
@@ -1747,7 +1687,7 @@ mod tests {
         let app = App::new(snapshot(vec![agent("standalone", Vec::new())]));
         let selected = app.selected_agent().unwrap();
         assert_eq!(table_session_name(selected, 0), "standalone");
-        let text = tree_detail(&app, selected, 120, 40, &Theme::new(ThemeMode::Dark, true)).to_string();
+        let text = tree_detail(&app, selected, 120, &Theme::new(ThemeMode::Dark, true)).to_string();
         assert!(text.starts_with("process tree"));
         assert!(!text.contains("session tree"));
         assert!(!text.contains("CPU/RSS shared"));
@@ -1820,10 +1760,6 @@ mod tests {
                 app.rebuild_rows();
                 let buf = render_buffer(&mut app, 180, 48, &theme);
 
-                assert_text_style(&buf, "session tree", theme.accent, theme.background);
-                assert_text_style(&buf, "[session] main", theme.dim, theme.background);
-                assert_text_style(&buf, "[subagent] Scout (explorer)", theme.accent, theme.background);
-                assert_text_style(&buf, "[subagent] Review (reviewer)", theme.dim, theme.background);
                 assert_text_style(&buf, "CPU/RSS shared by sessions", theme.dim, theme.background);
                 assert_text_style(&buf, "process tree", theme.accent, theme.background);
                 assert_text_style(&buf, "[agent]", theme.green, theme.background);

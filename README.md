@@ -81,10 +81,11 @@ and, for Claude Code, priced.
 
 Press `t` to open it and `Tab` to switch between two views.
 
-**Trees.** Codex sessions with recorded parent metadata are nested beneath their
-parent, with each session's own usage. The separate process tree labels real
-processes `agent`, `mcp`, `shell` or `tool`; nested processes are not assumed to
-be logical subagents, and shared process memory is counted once.
+**Process tree.** Every process under the agent, labelled `agent`, `mcp`,
+`shell` or `tool`, with the token breakdown beside it. A nested agent process is
+not assumed to be a subagent. Codex subagents are sessions inside one process:
+the table nests them beneath their parent, each with its own usage, and the
+shared process memory is counted once.
 
 **MCP servers.** Below the tree, one line per MCP server the agent uses: the
 server's pid, how many times the agent has called it, how many of those calls
