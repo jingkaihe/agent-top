@@ -53,10 +53,18 @@ evenly between them, so per-source figures are not exact. The first response's
 whole prompt, the replies, and any growth that no result explains (your own
 messages) go to one row, `prompts & replies`.
 
+**Codex response ordering.** Some versions log tool results before the usage
+of the response that requested them. Those results wait for the following,
+consuming response; they do not receive the initial prompt's tokens. Repeated
+usage snapshots do not consume queued results or add cost.
+
 **Codex code mode.** A wrapper with one recognised nested tool uses that tool's
 name when its timing fits entirely inside the wrapper. This link is a timing
 heuristic. Multiple, unknown or overlapping calls keep `exec` (or `wait`).
 Each wrapper output contributes once; nested completions do not add context tokens.
+Child output bytes or tokenizer counts cannot reliably split a wrapper that
+filters, combines or discards those outputs. No result bodies are inspected
+for weighting.
 
 **Cost.** Every response re-reads the whole context, so each source's tokens
 are charged at every response that read them, at that response's own prompt

@@ -17,14 +17,16 @@
 //!   `web_search_call`, or an assistant `message`.
 //! * `response_item` `web_search_call` is one server-side web search.
 //! * `info.last_token_usage` beside the cumulative record is the one
-//!   response's usage. The first `token_count` of a turn repeats the
-//!   previous turn's last one, so a record identical to the one before it
-//!   is a snapshot, not a response. Context by source is sized from these:
-//!   each `*_output` item is filed under its call's name, re-filed under
-//!   the MCP server when the `mcp_tool_call_end` for that call id follows
-//!   (it comes after the output), and sized by the next response. Codex
+//!   response's usage. Repeated cumulative usage marks a snapshot; equal
+//!   per-response usage alone need not. Each `*_output` item is filed under
+//!   its call's name, re-filed under the MCP server when its
+//!   `mcp_tool_call_end` follows, and sized by the consuming response. Codex
 //!   writes no compaction marker that was seen, so the ledger's halving
 //!   rule stands in. See `ContextLedger`.
+//! * Usage ordering (0.130 fixture / 0.154.0 live and source, 2026-09-18):
+//!   newer versions emit `token_count` after draining tool outputs, older
+//!   ones before. The first model item freezes that response's input batch;
+//!   results produced during it wait for the next response.
 //!
 //! Codex model prices are not in the static table, so cost is reported as
 //! unpriced tokens.
@@ -316,8 +318,11 @@ pub struct CodexTranscript {
     /// Tool calls awaiting their output, by call id, so the output can be
     /// filed under the call's name.
     pending_tools: HashMap<String, PendingTool>,
-    /// The last per-response usage seen, to skip the repeated snapshot.
-    last_response: Option<TokenUsage>,
+    /// Completed results awaiting the next model response.
+    context_results: Vec<(String, ContextOrigin, String)>,
+    response_in_progress: bool,
+    /// Per-response and cumulative usage, to skip repeated snapshots.
+    last_response: Option<(TokenUsage, Option<TokenUsage>)>,
 }
 
 struct PendingTool {
@@ -346,6 +351,8 @@ impl CodexTranscript {
             turn: None,
             inference: None,
             pending_tools: HashMap::new(),
+            context_results: Vec::new(),
+            response_in_progress: false,
             last_response: None,
         }
     }
@@ -452,6 +459,18 @@ impl CodexTranscript {
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
         let payload = v.get("payload");
         let ptype = payload.and_then(|p| p.get("type")).and_then(Value::as_str).unwrap_or("");
+        if !self.response_in_progress
+            && kind == "response_item"
+            && (matches!(
+                ptype,
+                "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call" | "web_search_call" | "reasoning"
+            ) || (ptype == "message" && payload.and_then(|p| p.get("role")).and_then(Value::as_str) == Some("assistant")))
+        {
+            for (id, origin, name) in self.context_results.drain(..) {
+                self.summary.context.result(&id, origin, &name);
+            }
+            self.response_in_progress = true;
+        }
         match kind {
             // Forked history can contain parent headers, including across tail
             // refreshes. They must not replace this rollout's own metadata.
@@ -470,7 +489,8 @@ impl CodexTranscript {
             }
             "event_msg" => match ptype {
                 "token_count" => {
-                    if let Some(total) = payload.and_then(|p| p.pointer("/info/total_token_usage")) {
+                    let total = payload.and_then(|p| p.pointer("/info/total_token_usage")).filter(|v| v.is_object());
+                    if let Some(total) = total {
                         let g = |k: &str| total.get(k).and_then(Value::as_u64).unwrap_or(0);
                         self.summary.health.usage_records += 1;
                         if g("input_tokens") + g("output_tokens") + g("cached_input_tokens") == 0 {
@@ -498,7 +518,7 @@ impl CodexTranscript {
                             }
                         }
                     }
-                    if let Some(last) = payload.and_then(|p| p.pointer("/info/last_token_usage")) {
+                    if let Some(last) = payload.and_then(|p| p.pointer("/info/last_token_usage")).filter(|v| v.is_object()) {
                         let g = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
                         let cached = g("cached_input_tokens");
                         let usage = TokenUsage {
@@ -507,7 +527,8 @@ impl CodexTranscript {
                             output: g("output_tokens"),
                             ..Default::default()
                         };
-                        if self.last_response != Some(usage) {
+                        let response = (usage, total.map(|_| self.summary.usage));
+                        if usage.prompt() > 0 && self.last_response != Some(response) {
                             let cost = self
                                 .summary
                                 .model
@@ -516,7 +537,8 @@ impl CodexTranscript {
                                 .map(|p| p.breakdown(&usage))
                                 .unwrap_or_default();
                             self.summary.context.response(&usage, &cost);
-                            self.last_response = Some(usage);
+                            self.last_response = Some(response);
+                            self.response_in_progress = false;
                         }
                     }
                     // The rate-limit snapshot rides on every token_count; the
@@ -561,7 +583,12 @@ impl CodexTranscript {
                         u.calls += 1;
                         u.errors += u64::from(error);
                         u.last_call = u.last_call.max(ts);
-                        self.summary.context.retag(&payload.map(call_id).unwrap_or_default(), ContextOrigin::Mcp, server);
+                        let id = payload.map(call_id).unwrap_or_default();
+                        if let Some((_, origin, name)) = self.context_results.iter_mut().find(|(i, _, _)| *i == id) {
+                            *origin = ContextOrigin::Mcp;
+                            *name = server.to_string();
+                        }
+                        self.summary.context.retag(&id, ContextOrigin::Mcp, server);
                     }
                 }
                 "task_complete" | "turn_aborted" | "error" => {
@@ -577,6 +604,7 @@ impl CodexTranscript {
                         pending.active = false;
                         pending.ambiguous = true;
                     }
+                    self.response_in_progress = false;
                 }
                 _ => {}
             },
@@ -615,7 +643,7 @@ impl CodexTranscript {
                             },
                             None => (ContextOrigin::Tool, "tool".into()),
                         };
-                        self.summary.context.result(&id, origin, &name);
+                        self.context_results.push((id, origin, name));
                         self.begin_inference(ts);
                     }
                 }
@@ -707,6 +735,20 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::time::Duration;
+
+    fn record_response(t: &mut CodexTranscript, input: u64, cached: u64, output: u64) -> String {
+        let line = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+            "last_token_usage":{"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output},
+            "total_token_usage":{
+                "input_tokens":t.summary.usage.prompt() + input,
+                "cached_input_tokens":t.summary.usage.cache_read + cached,
+                "output_tokens":t.summary.usage.output + output,
+            },
+        }}})
+        .to_string();
+        t.ingest(&line);
+        line
+    }
 
     /// The bug this guards: the year and month directories were last touched
     /// when a child directory was created, long before the rollout of
@@ -1019,38 +1061,142 @@ mod tests {
 
     #[test]
     fn sizes_context_per_tool_from_last_token_usage_and_skips_the_repeated_snapshot() {
-        let dir = std::env::temp_dir().join(format!("agent-top-codex-context-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("rollout.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        let count = |input: u64, cached: u64, out: u64| {
-            format!(
-                r#"{{"timestamp":"2026-05-27T09:00:00.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{out}}},"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{out}}}}}}}}}"#
-            )
-        };
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:00.000Z","type":"session_meta","payload":{{"id":"s","cwd":"/tmp"}}}}"#).unwrap();
-        writeln!(f, "{}", count(10_000, 0, 100)).unwrap();
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:01.000Z","type":"response_item","payload":{{"type":"function_call","call_id":"c1","name":"exec_command"}}}}"#).unwrap();
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:01.000Z","type":"response_item","payload":{{"type":"function_call","call_id":"c2","name":"github_fetch_file"}}}}"#).unwrap();
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:02.000Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"c1"}}}}"#).unwrap();
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:02.000Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"c2"}}}}"#).unwrap();
-        // The server is named only after the output was written.
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:02.100Z","type":"event_msg","payload":{{"type":"mcp_tool_call_end","call_id":"c2","invocation":{{"server":"codex_apps","tool":"github_fetch_file"}},"result":{{"Ok":{{}}}}}}}}"#).unwrap();
-        // 10_000 + 100 reply + 3_000 of results, half each.
-        writeln!(f, "{}", count(13_100, 12_000, 40)).unwrap();
-        // A new turn re-emits the last record: not a response.
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:01:00.000Z","type":"event_msg","payload":{{"type":"task_started"}}}}"#).unwrap();
-        writeln!(f, "{}", count(13_100, 12_000, 40)).unwrap();
-        let mut t = CodexTranscript::new(&path).with_prices(pricing::builtin_table());
-        t.refresh().unwrap();
-        let c: HashMap<String, crate::model::ContextSource> =
-            t.summary().context.sources().into_iter().map(|c| (c.name.clone(), c)).collect();
-        assert_eq!(c["exec_command"].tokens, 1_500);
-        assert_eq!((c["codex_apps"].tokens, c["codex_apps"].origin), (1_500, ContextOrigin::Mcp));
-        assert!(!c.contains_key("github_fetch_file"), "re-filed under its server");
-        assert_eq!(c["other"].tokens, 10_100, "the repeated snapshot added nothing");
-        assert_eq!(c["other"].cost_usd, 0.0, "no price for the model: tokens only");
-        let _ = std::fs::remove_dir_all(&dir);
+        for delayed in [false, true] {
+            let mut t = CodexTranscript::new("unused.jsonl").with_prices(pricing::builtin_table());
+            t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"exec_command"}}"#);
+            t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c2","name":"github_fetch_file"}}"#);
+            if !delayed {
+                record_response(&mut t, 10_000, 0, 100);
+            }
+            t.ingest(
+                r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}"#,
+            );
+            t.ingest(
+                r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c2"}}"#,
+            );
+            t.ingest(r#"{"type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"c2","invocation":{"server":"codex_apps","tool":"github_fetch_file"},"result":{"Ok":{}}}}"#);
+            if delayed {
+                record_response(&mut t, 10_000, 0, 100);
+            }
+            let initial = t.summary.context.sources();
+            assert_eq!(initial.len(), 1);
+            assert_eq!((initial[0].name.as_str(), initial[0].tokens), ("other", 10_000));
+
+            t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+            let snapshot = record_response(&mut t, 13_100, 12_000, 40);
+            t.ingest(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#);
+            t.ingest(&snapshot);
+            let c: HashMap<_, _> = t.summary.context.sources().into_iter().map(|c| (c.name.clone(), c)).collect();
+            assert_eq!((c["exec_command"].calls, c["exec_command"].tokens), (1, 1_500));
+            assert_eq!((c["codex_apps"].calls, c["codex_apps"].tokens, c["codex_apps"].origin), (1, 1_500, ContextOrigin::Mcp));
+            assert!(!c.contains_key("github_fetch_file"));
+            assert_eq!(c["other"].tokens, 10_100);
+            assert_eq!(c["other"].cost_usd, 0.0);
+        }
+    }
+
+    #[test]
+    fn delayed_usage_charges_only_results_consumed_by_that_response() {
+        let mut t = CodexTranscript::new("unused.jsonl").with_prices(pricing::builtin_table());
+        t.ingest(r#"{"type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"exec_command"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}"#);
+        // A later item in the same streamed response must not consume c1.
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        let snapshot = record_response(&mut t, 1_000, 200, 10);
+        let initial = t.summary.context.sources();
+        assert_eq!(initial.len(), 1);
+        assert_eq!((initial[0].name.as_str(), initial[0].tokens), ("other", 1_000));
+
+        t.ingest(r#"{"type":"response_item","payload":{"type":"reasoning"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"c2","name":"apply_patch"}}"#);
+        t.ingest(
+            r#"{"timestamp":"2026-09-18T09:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c2"}}"#,
+        );
+        for snapshot in [
+            snapshot.as_str(),
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":null}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{}}}}"#,
+        ] {
+            t.ingest(snapshot);
+        }
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        assert_eq!(t.summary.context.sources(), initial);
+        record_response(&mut t, 1_300, 1_100, 20);
+        let sources = t.summary.context.sources();
+        let command = sources.iter().find(|s| s.name == "exec_command").unwrap();
+        assert_eq!((command.calls, command.tokens), (1, 290));
+        assert!(!sources.iter().any(|s| s.name == "apply_patch"));
+
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        record_response(&mut t, 1_350, 1_200, 5);
+        let sources = t.summary.context.sources();
+        let patch = sources.iter().find(|s| s.name == "apply_patch").unwrap();
+        assert_eq!((patch.calls, patch.tokens), (1, 30));
+        assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 1_350);
+        let prompt_cost = t.summary.cost_breakdown.input + t.summary.cost_breakdown.cache_read;
+        assert!(prompt_cost > 0.0);
+        assert!((sources.iter().map(|s| s.cost_usd).sum::<f64>() - prompt_cost).abs() < 1e-9);
+        assert_eq!((t.summary.usage.prompt(), t.summary.usage.output, t.summary.tool_calls), (3_650, 35, 2));
+    }
+
+    #[test]
+    fn tool_search_errors_are_not_part_of_the_requesting_responses_prompt() {
+        let mut t = CodexTranscript::new("unused.jsonl");
+        t.ingest(r#"{"type":"response_item","payload":{"type":"tool_search_call","call_id":"search"}}"#);
+        t.ingest(
+            r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call_output","call_id":"search"}}"#,
+        );
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        record_response(&mut t, 1_000, 0, 10);
+        let sources = t.summary.context.sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!((sources[0].name.as_str(), sources[0].tokens), ("other", 1_000));
+
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        record_response(&mut t, 1_060, 0, 10);
+        let sources = t.summary.context.sources();
+        let tool = sources.iter().find(|s| s.origin == ContextOrigin::Tool).unwrap();
+        assert_eq!((tool.calls, tool.tokens), (1, 50));
+    }
+
+    #[test]
+    fn identical_response_usage_is_not_a_snapshot_when_cumulative_usage_advances() {
+        let mut t = CodexTranscript::new("unused.jsonl").with_prices(pricing::builtin_table());
+        t.ingest(r#"{"type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"exec_command"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}"#);
+        let snapshot = record_response(&mut t, 1_000, 0, 10);
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        t.ingest(&snapshot);
+        assert_eq!(t.summary.context.sources().len(), 1);
+        record_response(&mut t, 1_000, 0, 10);
+        let sources = t.summary.context.sources();
+        let command = sources.iter().find(|s| s.name == "exec_command").unwrap();
+        assert_eq!((command.calls, command.tokens), (1, 0));
+        assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 1_000);
+        assert!((sources.iter().map(|s| s.cost_usd).sum::<f64>() - t.summary.cost_breakdown.input).abs() < 1e-9);
+    }
+
+    #[test]
+    fn interrupted_responses_keep_results_for_the_next_consuming_response() {
+        for ending in ["turn_aborted", "error"] {
+            let mut t = CodexTranscript::new("unused.jsonl");
+            let snapshot = record_response(&mut t, 1_000, 0, 10);
+            t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"exec_command"}}"#);
+            t.ingest(
+                r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}"#,
+            );
+            t.ingest(&serde_json::json!({"type":"event_msg","payload":{"type":ending}}).to_string());
+            t.ingest(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#);
+            t.ingest(&snapshot);
+            t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+            record_response(&mut t, 1_110, 0, 10);
+            let sources = t.summary.context.sources();
+            let command = sources.iter().find(|s| s.name == "exec_command").unwrap();
+            assert_eq!((command.calls, command.tokens), (1, 100));
+        }
     }
 
     #[test]
@@ -1160,7 +1306,9 @@ mod tests {
         assert!(tools.iter().all(|s| !s.error));
         assert!(t.pending_tools.is_empty(), "completion items do not leave unmatched response calls");
         // Only wrapper outputs contribute to context accounting.
-        let usage = TokenUsage { input: 100, ..Default::default() };
+        record_response(&mut t, 1_000, 0, 0);
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        let usage = TokenUsage { input: 1_100, ..Default::default() };
         let cost = crate::model::CostBreakdown { input: 1.0, ..Default::default() };
         t.summary.context.response(&usage, &cost);
         let sources = t.summary.context.sources();
@@ -1171,10 +1319,11 @@ mod tests {
         assert!(!sources.iter().any(|s| s.name == "exec"));
 
         let mut baseline = crate::harness::ContextLedger::default();
+        baseline.response(&TokenUsage { input: 1_000, ..Default::default() }, &Default::default());
         baseline.result("call_wrapper_1", ContextOrigin::Tool, "exec");
         baseline.result("call_wrapper_2", ContextOrigin::Tool, "exec");
         baseline.response(&usage, &cost);
-        for input in [150, 180] {
+        for input in [1_150, 1_180] {
             let usage = TokenUsage { input, ..Default::default() };
             t.summary.context.response(&usage, &cost);
             baseline.response(&usage, &cost);
@@ -1222,8 +1371,10 @@ mod tests {
                 t.summary.spans.open(format!("filler-{i}"), "tool".into(), SystemTime::UNIX_EPOCH, false);
             }
             t.ingest(r#"{"timestamp":"1970-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper"}}"#);
-            t.summary.context.response(&TokenUsage { input: 100, ..Default::default() }, &Default::default());
-            let sources = t.summary.context.sources();
+            record_response(&mut t, 1_000, 0, 0);
+            t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+            record_response(&mut t, 1_100, 0, 0);
+            let sources: Vec<_> = t.summary.context.sources().into_iter().filter(|s| s.origin != ContextOrigin::Other).collect();
             assert_eq!(sources.len(), 1);
             assert_eq!((sources[0].name.as_str(), sources[0].calls, sources[0].tokens), (expected, 1, 100));
         }
@@ -1251,11 +1402,13 @@ mod tests {
                         .to_string(),
                     );
                 }
-                t.summary.context.response(&TokenUsage { input: 100, ..Default::default() }, &Default::default());
+                record_response(&mut t, 1_000, 0, 0);
+                t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+                record_response(&mut t, 1_100, 0, 0);
                 let sources = t.summary.context.sources();
                 assert_eq!(sources.iter().any(|s| s.name == "apply_patch"), other == "wait_agent");
                 assert_eq!(sources.iter().map(|s| s.calls).sum::<u64>(), 2);
-                assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 100);
+                assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 1_100);
             }
         }
     }
@@ -1281,9 +1434,11 @@ mod tests {
             ] {
                 t.ingest(&line.to_string());
             }
-            t.summary.context.response(&TokenUsage { input: 100, ..Default::default() }, &Default::default());
+            record_response(&mut t, 1_000, 0, 0);
+            t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+            record_response(&mut t, 1_100, 0, 0);
             let sources = t.summary.context.sources();
-            assert_eq!(sources.len(), 2);
+            assert_eq!(sources.len(), 3);
             for name in ["apply_patch", "exec"] {
                 let source = sources.iter().find(|s| s.name == name).unwrap();
                 assert_eq!((source.calls, source.tokens), (1, 50));
