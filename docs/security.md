@@ -34,7 +34,7 @@ mise run security             # both, the way CI does
 
 ## What it reads
 
-The process table (through `sysinfo` and, on macOS, `libproc`, not by shelling out to `ps`) and the transcript files each harness already writes. From a transcript it takes metadata: usage records (token counts), tool and MCP call names, ids, timestamps, session id, model, working directory. It does not read prompt text or tool output. [Context by source](accounting.md#context-by-source) works within that boundary: what a tool result added to the prompt is priced from the token counts alone, not from the result. [Accounting](accounting.md) has the arithmetic.
+The process table (through `sysinfo` and, on macOS, `libproc`, not by shelling out to `ps`) and the transcript files each harness already writes. From a transcript it takes metadata: usage records (token counts), tool and MCP call names, ids, timestamps, session id, model, working directory. It does not read prompt text or tool inputs. Of tool output it takes one thing: for Codex code mode, the byte length of each nested tool's output text, used to divide one wrapper call's share between the tools that ran inside it. The text is never stored, shown, exported or sent; only the number is kept. [Context by source](accounting.md#context-by-source) works within that boundary: what a tool result added to the prompt is priced from the token counts, not from the result. [Accounting](accounting.md) has the arithmetic.
 
 ## What it never does
 

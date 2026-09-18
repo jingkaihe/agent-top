@@ -57,8 +57,11 @@ Answer these before coding:
   entry, an open file handle). Otherwise return the matching
   `Attribution::CwdHeuristic` variant — AGENTS.md forbids presenting a guess as
   exact.
-- Read metadata fields only. No prompt text, no tool inputs, no tool output. And
-  nothing that writes, signals or connects: open the store read-only, the way
+- Read metadata fields only. No prompt text, no tool inputs, no tool output. The
+  one exception on record is Codex code mode, which takes the byte length of
+  nested output text as a weight and keeps only the number (docs/security.md,
+  "What it reads"); a new exception needs the same decision and the same doc
+  update. And nothing that writes, signals or connects: open the store read-only, the way
   `opencode.rs::open_ro` opens SQLite with `SQLITE_OPEN_READ_ONLY` so agent-top
   can never write to or lock the file the harness is using.
 - No file per session (a database, a server)? Mint a virtual path that stands

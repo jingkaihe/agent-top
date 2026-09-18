@@ -54,7 +54,7 @@ That second one is the kind of thing the advice panel is for:
 
 Three rules, applied to the numbers already on screen. A source whose results are large per call and have added a lot to the prompt. An MCP server attached to a live agent that has not been called in ten minutes, whose tool definitions are still sent with every response. A server whose memory is growing while unused. Each comes with one sentence of what you could do. Nothing is done for you.
 
-The numbers are computed from the usage records alone: how much bigger the next prompt was after each tool result. No tool output is ever read.
+The numbers are computed from the usage records: how much bigger the next prompt was after each tool result. No tool output is kept. For Codex code mode, where one call wraps several tools, the length of each tool's output decides how that call's share is divided, and only the length is used.
 
 ## 4. What all of it cost, by harness or by day
 
@@ -108,7 +108,7 @@ One row per tool call and model response, on a shared time axis, newest at the b
 
 ## What it will not do
 
-agent-top observes. It does not kill or restart a process, write to a transcript, or send your data anywhere. It reads the files the harnesses already write and the process table the OS already keeps, metadata only, never prompt text or tool output. The one network call it makes on its own is a daily version check, which sends nothing about you and which `AGENT_TOP_NO_UPDATE_CHECK=1` turns off.
+agent-top observes. It does not kill or restart a process, write to a transcript, or send your data anywhere. It reads the files the harnesses already write and the process table the OS already keeps, metadata only: never prompt text, and of tool output only its length (see [what it reads](../../security.md#what-it-reads)). The one network call it makes on its own is a daily version check, which sends nothing about you and which `AGENT_TOP_NO_UPDATE_CHECK=1` turns off.
 
 ## Try it
 
