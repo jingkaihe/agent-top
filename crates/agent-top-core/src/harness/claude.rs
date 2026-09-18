@@ -205,7 +205,7 @@ impl HarnessAdapter for ClaudeAdapter {
 
     /// The registry is re-read every pass: it is a handful of small files and
     /// its `status` is what the state column shows.
-    fn prepare(&mut self, _roots: &[&ProcNode]) {
+    fn prepare(&mut self, _roots: &[&ProcNode], _by_pid: &HashMap<u32, &RawProc>) {
         self.registry = read_pid_sessions().into_iter().map(|s| (s.pid, s)).collect();
     }
 

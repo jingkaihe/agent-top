@@ -38,6 +38,33 @@ impl RawProc {
         let from_exe = self.exe.as_ref().and_then(|e| e.file_name()).map(|f| f.to_string_lossy().into_owned());
         from_cmd.or(from_exe).unwrap_or_else(|| self.name.clone())
     }
+
+    /// The npm launcher forwards argv[2..] unchanged to the native runtime.
+    /// Verified against openai/codex rust-v0.154.0, codex-cli/bin/codex.js.
+    fn is_codex_launcher(&self) -> bool {
+        matches!(self.program().to_ascii_lowercase().as_str(), "node" | "node.exe" | "nodejs" | "bun" | "bun.exe")
+            && self.cmd.get(1).is_some_and(|s| s.replace('\\', "/").ends_with("/@openai/codex/bin/codex.js"))
+    }
+
+    fn codex_args(&self) -> Option<&[String]> {
+        if matches!(self.program().to_ascii_lowercase().as_str(), "codex" | "codex.exe") {
+            Some(self.cmd.get(1..).unwrap_or_default())
+        } else if self.is_codex_launcher() {
+            self.cmd.get(2..)
+        } else {
+            None
+        }
+    }
+
+    /// Whether this is the native runtime directly spawned by an npm launcher
+    /// for the same invocation, rather than a separately launched agent.
+    pub(crate) fn is_codex_runtime_of(&self, parent: &RawProc) -> bool {
+        self.ppid == Some(parent.pid)
+            && parent.is_codex_launcher()
+            && !self.is_codex_launcher()
+            && classify_agent(self) == Some(Harness::Codex)
+            && self.codex_args() == parent.codex_args()
+    }
 }
 
 fn basename(s: &str) -> String {
@@ -77,8 +104,13 @@ impl ProcessScanner {
     /// to be asked for. Each is read once per process (`OnlyIfNotSet`): a
     /// command line never changes, and an agent's working directory does not
     /// change in practice, so the per-tick cost stays at memory and CPU.
+    /// `nothing()` still includes Linux tasks by default. Exclude them: worker
+    /// threads share the process's command line and RSS, and process CPU already
+    /// includes their work. Treating them as children invents subagents and
+    /// counts the same resources again for every thread.
     fn refresh_kind() -> ProcessRefreshKind {
         ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_memory()
             .with_cpu()
             .with_exe(UpdateKind::OnlyIfNotSet)
@@ -129,8 +161,8 @@ pub fn classify_agent(p: &RawProc) -> Option<Harness> {
     if prog == "claude" || script.contains("@anthropic-ai/claude-code") || script.ends_with("/claude") {
         return Some(Harness::Claude);
     }
-    if prog == "codex" || script.contains("@openai/codex") {
-        return Some(Harness::Codex);
+    if let Some(args) = p.codex_args() {
+        return (!codex_helper(args)).then_some(Harness::Codex);
     }
     if prog == "gemini" || script.contains("@google/gemini-cli") {
         return Some(Harness::Gemini);
@@ -154,6 +186,10 @@ pub fn classify_agent(p: &RawProc) -> Option<Harness> {
 pub fn classify_child(p: &RawProc) -> ProcKind {
     let prog = p.program().to_ascii_lowercase();
     let joined = p.cmdline().to_ascii_lowercase();
+    // In particular, `codex mcp list` manages servers; it is not itself one.
+    if p.codex_args().is_some_and(codex_helper) {
+        return ProcKind::Tool;
+    }
     if matches!(prog.as_str(), "zsh" | "bash" | "sh" | "fish" | "dash" | "pwsh" | "cmd") {
         return ProcKind::Shell;
     }
@@ -161,6 +197,28 @@ pub fn classify_child(p: &RawProc) -> ProcKind {
         return ProcKind::Mcp;
     }
     ProcKind::Tool
+}
+
+/// Explicit helper invocations from Codex 0.154 and main 7a3c5a83e (2026-09-17)
+/// cli/arg0 dispatch. Match positions, never words inside prompts or commands.
+/// This is deliberately not a full Codex option parser; unrecognised forms
+/// retain the existing harness-name heuristic.
+fn codex_helper(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some(
+            "--codex-run-as-apply-patch"
+                | "--codex-run-as-arg0-exec-helper"
+                | "--codex-run-as-fs-helper"
+                | "--run-as-windows-sandbox"
+                | "--__codex-windows-mxc"
+                | "mcp"
+                | "sandbox"
+                | "exec-server"
+                | "stdio-to-uds"
+                | "responses-api-proxy"
+        )
+    ) || (args.first().map(String::as_str) == Some("app-server") && args.get(1).map(String::as_str) == Some("daemon"))
 }
 
 /// MCP servers have no wire-level marker visible from the process table, so
@@ -185,8 +243,8 @@ fn now_secs() -> u64 {
 /// Fold the flat table into a forest of agent trees plus the orphaned MCP list.
 ///
 /// An agent root is a process that classifies as a harness and has no
-/// harness ancestor. Harness processes nested under a root become
-/// `Subagent` nodes of that root's tree.
+/// harness ancestor. Nested harness processes are also `Agent` nodes; their
+/// position records OS ancestry, not a logical subagent relationship.
 pub fn build_forest(procs: &[RawProc]) -> (Vec<ProcNode>, Vec<ProcNode>) {
     let by_pid: HashMap<u32, &RawProc> = procs.iter().map(|p| (p.pid, p)).collect();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -235,7 +293,7 @@ pub fn build_forest(procs: &[RawProc]) -> (Vec<ProcNode>, Vec<ProcNode>) {
                 if c == pid {
                     continue;
                 }
-                let k = if harness_of.contains_key(&c) { ProcKind::Subagent } else { classify_child(by_pid[&c]) };
+                let k = if harness_of.contains_key(&c) { ProcKind::Agent } else { classify_child(by_pid[&c]) };
                 kids.push(build(c, k, by_pid, children, harness_of, now, depth + 1));
             }
         }
@@ -347,6 +405,159 @@ mod tests {
     }
 
     #[test]
+    fn refreshes_processes_without_tasks() {
+        let kind = ProcessScanner::refresh_kind();
+        assert!(!kind.tasks(), "Linux threads share their process's RSS and must not become tree nodes");
+        assert!(kind.memory());
+        assert!(kind.cpu());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scanner_excludes_live_worker_threads() {
+        use std::sync::mpsc;
+
+        std::thread::scope(|scope| {
+            let (ready, tid) = mpsc::channel();
+            let (_release, wait) = mpsc::channel::<()>();
+            scope.spawn(move || {
+                let path = std::fs::read_link("/proc/thread-self").unwrap();
+                let tid: u32 = path.file_name().unwrap().to_str().unwrap().parse().unwrap();
+                ready.send(tid).unwrap();
+                // Stay alive during both scans; dropping the sender also releases
+                // the worker if an assertion panics.
+                let _ = wait.recv();
+            });
+            let tid = tid.recv().unwrap();
+            let pid = std::process::id();
+            assert_ne!(tid, pid);
+
+            let mut scanner = ProcessScanner::new();
+            // Include the test process so we can check that only its leader is
+            // kept, independently of agent-top's normal self-PID exclusion.
+            scanner.self_pid = None;
+            for _ in 0..2 {
+                let procs = scanner.processes();
+                assert!(procs.iter().any(|p| p.pid == pid), "the process itself must remain visible");
+                assert!(!procs.iter().any(|p| p.pid == tid), "a worker thread is not a child process");
+                scanner.refresh();
+            }
+        });
+    }
+
+    #[test]
+    fn nested_harnesses_are_agents_with_each_process_counted_once() {
+        let mut procs = vec![
+            proc(10, None, &["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js", "--yolo"]),
+            proc(11, Some(10), &["/opt/codex/bin/codex", "--yolo"]),
+            proc(12, Some(11), &["bash", "-c", "codex --yolo"]),
+            proc(13, Some(12), &["codex", "--yolo"]),
+            proc(14, Some(10), &["codex", "exec", "review"]),
+            proc(15, Some(11), &["codex", "--yolo"]),
+        ];
+        for p in &mut procs {
+            p.rss_bytes = 100;
+            p.cpu_percent = 1.0;
+        }
+        let (roots, orphans) = build_forest(&procs);
+        assert!(orphans.is_empty());
+        assert_eq!(roots.len(), 1);
+        let root = &roots[0];
+        assert_eq!(root.pid, 10);
+        let runtime = &root.children[0];
+        assert_eq!(runtime.pid, 11);
+        assert_eq!(runtime.kind, ProcKind::Agent);
+        assert_eq!(runtime.children[0].kind, ProcKind::Shell);
+        assert_eq!(runtime.children[0].children[0].kind, ProcKind::Agent, "tool-launched harnesses are still agents");
+        assert_eq!(runtime.children[1].kind, ProcKind::Agent);
+        assert_eq!(root.children[1].kind, ProcKind::Agent);
+        assert_eq!(root.totals(), (6.0, 600, 6, 0), "each real PID contributes resources exactly once");
+    }
+
+    #[test]
+    fn codex_runtime_matches_only_its_launcher_and_forwarded_arguments() {
+        let launcher = proc(10, None, &["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js", "exec", "review the diff"]);
+        let runtime = proc(11, Some(10), &["/opt/codex/bin/codex", "exec", "review the diff"]);
+        assert!(runtime.is_codex_runtime_of(&launcher));
+
+        for child in [
+            proc(12, Some(10), &["codex", "exec", "different task"]),
+            proc(12, Some(10), &["codex", "exec", "review", "the", "diff"]),
+            proc(12, Some(99), &["codex", "exec", "review the diff"]),
+            proc(12, Some(10), &["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js", "exec", "review the diff"]),
+        ] {
+            assert!(!child.is_codex_runtime_of(&launcher), "not the forwarded runtime: {child:?}");
+        }
+        let nested = proc(12, Some(11), &["codex", "exec", "review the diff"]);
+        assert!(!nested.is_codex_runtime_of(&runtime), "a native agent is not a launcher");
+
+        let launcher = proc(10, None, &["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js", "mcp", "list"]);
+        let helper = proc(11, Some(10), &["codex", "mcp", "list"]);
+        assert!(!helper.is_codex_runtime_of(&launcher), "a management helper does not own agent rollouts");
+    }
+
+    #[test]
+    fn legacy_process_subagent_kind_deserializes_as_agent() {
+        let kind: ProcKind = serde_json::from_str("\"subagent\"").unwrap();
+        assert_eq!(kind, ProcKind::Agent);
+        assert_eq!(kind.label(), "agent");
+        assert_eq!(serde_json::to_value(kind).unwrap(), "agent");
+    }
+
+    #[test]
+    fn codex_helpers_are_tools_not_agents_or_mcp_servers() {
+        let helpers: &[&[&str]] = &[
+            &["codex", "--codex-run-as-apply-patch", "patch"],
+            &["codex", "--codex-run-as-arg0-exec-helper"],
+            &["codex", "--codex-run-as-fs-helper"],
+            &["codex.exe", "--run-as-windows-sandbox"],
+            &["codex.exe", "--__codex-windows-mxc"],
+            &["codex", "mcp", "list"],
+            &["codex", "sandbox", "--", "sh"],
+            &["codex", "exec-server"],
+            &["codex", "stdio-to-uds", "/tmp/socket"],
+            &["codex", "responses-api-proxy"],
+            &["codex", "app-server", "daemon", "start"],
+            &["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js", "mcp", "list"],
+            &["codex-linux-sandbox", "--", "sh"],
+            &["apply_patch", "patch"],
+            &["applypatch", "patch"],
+        ];
+        let mut procs = vec![proc(1, None, &["codex", "--yolo"])];
+        for (i, cmd) in helpers.iter().enumerate() {
+            let mut p = proc(i as u32 + 2, Some(1), cmd);
+            // argv[0] dispatch aliases may all resolve to the Codex executable.
+            p.exe = Some(PathBuf::from("/opt/codex/bin/codex"));
+            assert_eq!(classify_agent(&p), None, "{cmd:?}");
+            assert_eq!(classify_child(&p), ProcKind::Tool, "{cmd:?}");
+            procs.push(p);
+        }
+        let (roots, orphans) = build_forest(&procs);
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].children.iter().all(|p| p.kind == ProcKind::Tool));
+        assert!(orphans.is_empty());
+
+        for cmd in [
+            vec!["codex"],
+            vec!["codex", "app-server", "--listen", "stdio://"],
+            vec!["codex", "exec", "mcp"],
+            vec!["codex", "--", "sandbox"],
+            vec!["codex", "review"],
+            vec!["codex", "resume", "--last"],
+            // This became a subcommand after 0.154, but is a valid prompt in
+            // that release. Do not exclude it without knowing the version.
+            vec!["codex", "tcp-tunnel"],
+        ] {
+            assert_eq!(classify_agent(&proc(20, None, &cmd)), Some(Harness::Codex), "{cmd:?}");
+        }
+        assert_eq!(
+            classify_agent(&proc(20, None, &["cat", "/usr/lib/node_modules/@openai/codex/bin/codex.js"])),
+            None,
+            "mentioning the launcher path is not running it"
+        );
+    }
+
+    #[test]
     fn classifies_roots_and_children() {
         let procs = vec![
             proc(1, None, &["/sbin/launchd"]),
@@ -366,7 +577,7 @@ mod tests {
         let root = &roots[0];
         assert_eq!(root.harness, Some(Harness::Claude));
         let kinds: Vec<ProcKind> = root.children.iter().map(|c| c.kind).collect();
-        assert_eq!(kinds, vec![ProcKind::Shell, ProcKind::Mcp, ProcKind::Subagent]);
+        assert_eq!(kinds, vec![ProcKind::Shell, ProcKind::Mcp, ProcKind::Agent]);
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].pid, 20);
         assert_eq!(session_id_from_args(&procs[1].cmd).as_deref(), Some("a29e19c3-2856-4510-87a0-80ce170ad830"));

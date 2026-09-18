@@ -2,7 +2,9 @@
 //! table, optional detail pane (process tree + token breakdown), key bar.
 
 use crate::app::{App, DetailView, Overlay, Panel};
-use crate::format::{age, bytes, cost, cpu_cell, duration_ms, mem_cell, short_cmd, short_model, tokens, tokens_cell, truncate};
+use crate::format::{
+    age, bytes, cost, cpu_cell, duration_ms, mem_cell, nested_name, session_name, short_cmd, short_model, tokens, tokens_cell, truncate,
+};
 use crate::theme::{Ramp, Theme};
 use agent_top_core::{Agent, AgentState, Attribution, McpMatch, OrphanOrigin, ProcKind, ProcNode, SpanKind, ToolSpan};
 use ratatui::Frame;
@@ -658,12 +660,12 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     )
     .bottom_margin(0);
 
-    let rows = app.rows.iter().map(|a| {
+    let rows = app.rows.iter().enumerate().map(|(i, a)| {
         let mem = mem_cell(a);
         let cpu = cpu_cell(a);
         let mcp_style = if a.mcp_count > 0 { Style::default().fg(theme.mauve) } else { Style::default() };
         Row::new(vec![
-            Cell::from(truncate(&a.name, 26)).style(Style::default().bold()),
+            Cell::from(table_session_name(a, app.row_depths[i])).style(Style::default().bold()),
             Cell::from(a.harness.label()),
             Cell::from(a.state.label()).style(state_style(a.state, theme)),
             Cell::from(a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
@@ -730,16 +732,14 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         f.render_widget(block("detail", theme), area);
         return;
     };
-    let title = format!("{} · {} · {}  [{}]", a.name, a.harness.label(), a.state.label(), app.detail.label());
+    let title = format!("{} · {} · {}  [{}]", session_name(a), a.harness.label(), a.state.label(), app.detail.label());
     let outer = block(&title, theme);
     let inner = outer.inner(area);
     f.render_widget(outer, area);
     let [left, right] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(inner);
     f.render_widget(Paragraph::new(agent_facts(a, app.snapshot.taken_at, theme)).wrap(Wrap { trim: false }), left);
     let panel = match app.detail {
-        DetailView::Tree => {
-            process_tree(a, &app.snapshot.orphans, &app.snapshot.orphan_origins, app.snapshot.taken_at, right.width as usize, theme)
-        }
+        DetailView::Tree => tree_detail(app, a, right.width as usize, theme),
         DetailView::Trace => tool_trace(a, app.snapshot.taken_at, right.width as usize, right.height as usize, theme),
     };
     f.render_widget(Paragraph::new(panel), right);
@@ -747,6 +747,10 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 
 fn kv<'a>(k: &'a str, v: String, theme: &Theme) -> Line<'a> {
     Line::from(vec![Span::styled(format!("{k:<11}"), Style::default().fg(theme.dim)), Span::raw(v)])
+}
+
+fn table_session_name(a: &Agent, depth: usize) -> String {
+    nested_name(a, depth, 26)
 }
 
 /// One line of the cost breakdown: tokens, the price they were charged at,
@@ -860,8 +864,17 @@ fn agent_facts(a: &Agent, now: SystemTime, theme: &Theme) -> Text<'static> {
     // Identity first, then the headline numbers a glance wants (cost, cache,
     // turns, tools) high up, so a short detail pane never clips them; the
     // per-token cost breakdown, a dig-deeper detail, comes below them.
+    lines.push(kv("session", a.session_id.clone().unwrap_or_else(|| "-".into()), theme));
+    if let Some(info) = &a.subagent {
+        lines.push(kv("parent", info.parent_session_id.clone(), theme));
+        if let Some(nickname) = &info.nickname {
+            lines.push(kv("nickname", nickname.clone(), theme));
+        }
+        if let Some(role) = &info.role {
+            lines.push(kv("role", role.clone(), theme));
+        }
+    }
     lines.extend(vec![
-        kv("session", a.session_id.clone().unwrap_or_else(|| "-".into()), theme),
         kv("cwd", a.cwd.as_deref().map(tilde).unwrap_or_else(|| "-".into()), theme),
         kv("model", a.model.clone().unwrap_or_else(|| "-".into()), theme),
         kv("version", a.harness_version.clone().unwrap_or_else(|| "-".into()), theme),
@@ -879,7 +892,15 @@ fn agent_facts(a: &Agent, now: SystemTime, theme: &Theme) -> Text<'static> {
         ]),
         cache_line(a, theme),
         kv("tokens", tokens(u.total()), theme),
-        kv("turns", format!("{} ({} subagent)", a.turns, a.subagent_turns), theme),
+        kv(
+            "turns",
+            if a.harness == agent_top_core::Harness::Codex {
+                a.turns.to_string()
+            } else {
+                format!("{} ({} subagent)", a.turns, a.subagent_turns)
+            },
+            theme,
+        ),
         kv("tool calls", a.tool_calls.to_string(), theme),
     ]);
     if a.web_searches > 0 {
@@ -1097,15 +1118,49 @@ fn busy_ms(shown: &[&ToolSpan], now: SystemTime) -> u64 {
     total.as_millis() as u64
 }
 
-fn process_tree(a: &Agent, orphans: &[ProcNode], origins: &[OrphanOrigin], now: SystemTime, width: usize, theme: &Theme) -> Text<'static> {
+/// The process tree of the selected row. Sessions that share a process show
+/// the tree of the row that owns it; the table carries the session hierarchy.
+fn tree_detail(app: &App, selected: &Agent, width: usize, theme: &Theme) -> Text<'static> {
+    let mut lines = Vec::new();
+    let process = selected
+        .pid
+        .and_then(|pid| app.snapshot.agents.iter().find(|a| a.pid == Some(pid) && a.harness == selected.harness && a.tree.is_some()))
+        .unwrap_or(selected);
+    let shared = selected.shares_process
+        || (selected.pid.is_some()
+            && app.snapshot.agents.iter().filter(|a| a.pid == selected.pid && a.harness == selected.harness).count() > 1);
+    if shared {
+        lines.push(Line::styled("CPU/RSS shared by sessions", Style::default().fg(theme.dim)));
+    }
+    lines.extend(
+        process_tree(selected, process, &app.snapshot.orphans, &app.snapshot.orphan_origins, app.snapshot.taken_at, width, theme).lines,
+    );
+    Text::from(lines)
+}
+
+fn process_tree(
+    a: &Agent,
+    process: &Agent,
+    orphans: &[ProcNode],
+    origins: &[OrphanOrigin],
+    now: SystemTime,
+    width: usize,
+    theme: &Theme,
+) -> Text<'static> {
     let mut lines = vec![Line::from(vec![
         Span::styled("process tree", Style::default().fg(theme.accent).bold()),
         Span::styled(
-            format!("   {} procs · {} mcp · cpu {:.1}% · rss {}", a.process_count, a.mcp_count, a.cpu_percent, bytes(a.rss_bytes)),
+            format!(
+                "   {} procs · {} mcp · cpu {:.1}% · rss {}",
+                process.process_count,
+                process.mcp_count,
+                process.cpu_percent,
+                bytes(process.rss_bytes)
+            ),
             Style::default().fg(theme.dim),
         ),
     ])];
-    match &a.tree {
+    match &process.tree {
         None if a.shares_process => lines
             .push(Line::styled("  shares its process with another conversation; see the row that owns it", Style::default().fg(theme.dim))),
         None => lines.push(Line::styled("  (no live process)", Style::default().fg(theme.dim))),
@@ -1232,7 +1287,6 @@ fn render_node(n: &ProcNode, prefix: &str, last: bool, root: bool, width: usize,
     };
     let (tag, style) = match n.kind {
         ProcKind::Agent => ("agent", Style::default().fg(theme.green).bold()),
-        ProcKind::Subagent => ("subagent", Style::default().fg(theme.green)),
         ProcKind::Mcp => ("mcp", Style::default().fg(theme.mauve).bold()),
         ProcKind::Shell => ("shell", Style::default().fg(theme.blue)),
         ProcKind::Tool => ("tool", Style::default().fg(theme.text)),
@@ -1442,6 +1496,7 @@ mod tests {
             activity: agent_top_core::Activity::Working,
             pid: Some(4242),
             session_id: Some("a29e19c3".into()),
+            subagent: None,
             session_path: None,
             cwd: None,
             model: Some("claude-fable-5-1".into()),
@@ -1470,6 +1525,172 @@ mod tests {
             parse_warning: None,
             rate_limit: None,
         }
+    }
+
+    #[test]
+    fn old_process_subagents_render_as_agents() {
+        let node = ProcNode {
+            pid: 42,
+            ppid: Some(41),
+            name: "codex".into(),
+            cmdline: "codex exec review".into(),
+            kind: serde_json::from_str("\"subagent\"").unwrap(),
+            harness: Some(agent_top_core::Harness::Codex),
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            age_secs: 1,
+            cwd: None,
+            children: Vec::new(),
+        };
+        let mut lines = Vec::new();
+        render_node(&node, "", true, false, 120, &mut lines, &Theme::new(ThemeMode::Dark, true));
+        assert!(lines[0].to_string().contains("[agent]"));
+        assert!(!lines[0].to_string().contains("subagent"));
+        assert_eq!(serde_json::to_value(node.kind).unwrap(), "agent");
+    }
+
+    fn codex_family() -> Vec<Agent> {
+        let mut parent = agent("main", Vec::new());
+        parent.harness = agent_top_core::Harness::Codex;
+        parent.session_id = Some("session-main".into());
+        parent.id = "session-main".into();
+        parent.subagent_turns = 0;
+        parent.usage = TokenUsage { input: 100, ..Default::default() };
+        parent.rss_bytes = 256 << 20;
+        parent.process_count = 1;
+        parent.mcp_count = 0;
+        parent.tree = Some(ProcNode {
+            pid: 4242,
+            ppid: None,
+            name: "codex".into(),
+            cmdline: "codex --yolo".into(),
+            kind: ProcKind::Agent,
+            harness: Some(agent_top_core::Harness::Codex),
+            cpu_percent: 6.6,
+            rss_bytes: parent.rss_bytes,
+            age_secs: 60,
+            cwd: None,
+            children: Vec::new(),
+        });
+        let mut child = parent.clone();
+        child.id = "session-scout".into();
+        child.session_id = Some("session-scout".into());
+        child.usage.input = 200;
+        child.subagent = Some(agent_top_core::SubagentInfo {
+            parent_session_id: "session-main".into(),
+            nickname: Some("Scout".into()),
+            role: Some("explorer".into()),
+        });
+        child.shares_process = true;
+        child.rss_bytes = 0;
+        child.cpu_percent = 0.0;
+        child.process_count = 0;
+        child.tree = None;
+        let mut grandchild = child.clone();
+        grandchild.id = "session-review".into();
+        grandchild.session_id = Some("session-review".into());
+        grandchild.usage.input = 300;
+        grandchild.subagent = Some(agent_top_core::SubagentInfo {
+            parent_session_id: "session-scout".into(),
+            nickname: Some("Review".into()),
+            role: Some("reviewer".into()),
+        });
+        vec![grandchild, parent, child]
+    }
+
+    #[test]
+    fn subagent_rows_nest_in_the_table_and_share_the_owners_process_tree() {
+        let mut app = App::new(snapshot(codex_family()));
+        app.selected_id = Some("session-scout".into());
+        app.rebuild_rows();
+        assert_eq!(app.row_depths, vec![0, 1, 2]);
+        assert_eq!(table_session_name(&app.rows[1], 1), "↳ Scout (explorer)");
+        assert_eq!(table_session_name(&app.rows[2], 2), "  ↳ Review (reviewer)");
+        let selected = app.selected_agent().unwrap();
+        assert_eq!(mem_cell(selected), "·");
+        assert_eq!(cpu_cell(selected), "·");
+        let theme = Theme::new(ThemeMode::Dark, true);
+        let text = tree_detail(&app, selected, 120, &theme).to_string();
+        assert!(!text.contains("session tree"), "the table carries the hierarchy: {text}");
+        let (before, processes) = text.split_once("CPU/RSS shared by sessions").unwrap();
+        assert!(before.is_empty(), "{text}");
+        assert!(processes.contains("process tree"));
+        assert!(processes.contains("rss 256M"));
+        assert_eq!(processes.matches("[agent]").count(), 1, "show the owner's actual process tree once");
+        assert!(!processes.contains("[subagent"));
+        assert_eq!(app.snapshot.totals.tokens, 600);
+        assert_eq!(app.snapshot.totals.rss_bytes, 256 << 20);
+        let facts = agent_facts(selected, app.snapshot.taken_at, &theme).to_string();
+        assert!(facts.contains("parent     session-main"), "{facts}");
+        assert!(facts.contains("nickname   Scout"));
+        assert!(!facts.contains("(0 subagent)"));
+        let out = render(&mut app, 180, 48);
+        assert!(out.contains("↳ Scout (explorer)"), "{out}");
+        assert!(out.contains("Scout (explorer) · codex · running  [tree]"), "the detail title identifies the selected session: {out}");
+        assert!(out.contains("process tree"));
+    }
+
+    #[test]
+    fn orphan_session_retains_metadata_and_hidden_owner_is_still_inspectable() {
+        let mut family = codex_family();
+        family.iter_mut().find(|a| a.id == "session-main").unwrap().state = AgentState::Stopped;
+        let mut app = App::new(snapshot(family));
+        app.show_stopped = false;
+        app.selected_id = Some("session-scout".into());
+        app.rebuild_rows();
+        assert_eq!(app.rows.len(), 2);
+        let selected = app.selected_agent().unwrap();
+        assert!(table_session_name(selected, 0).starts_with("[subagent]"));
+        let theme = Theme::new(ThemeMode::Dark, true);
+        let text = tree_detail(&app, selected, 120, &theme).to_string();
+        assert!(text.contains("rss 256M"), "the hidden resource-owner row remains inspectable: {text}");
+        let facts = agent_facts(selected, app.snapshot.taken_at, &theme).to_string();
+        assert!(facts.contains("parent     session-main"), "the facts still name the hidden parent: {facts}");
+
+        app.snapshot.agents.retain(|a| a.id != "session-main");
+        app.rebuild_rows();
+        let text = tree_detail(&app, app.selected_agent().unwrap(), 120, &theme).to_string();
+        assert!(text.contains("shares its process"));
+        assert!(!text.contains("[agent]"), "do not fabricate a missing process tree");
+    }
+
+    /// `--once` names and nests subagent rows the way the live table does;
+    /// without it a parent and its children print the same name.
+    #[test]
+    fn the_plain_table_names_and_nests_subagent_rows() {
+        let out = crate::format::plain_table(&snapshot(codex_family()));
+        let names: Vec<&str> = out.lines().skip(1).take(3).map(|l| l[..l.find(" codex").unwrap()].trim_end()).collect();
+        assert_eq!(names, ["main", "↳ Scout (explorer)", "  ↳ Review (reviewer)"], "{out}");
+
+        let mut family = codex_family();
+        family.retain(|a| a.id != "session-main");
+        let out = crate::format::plain_table(&snapshot(family));
+        assert!(out.lines().nth(1).unwrap().starts_with("[subagent] Scout"), "a row whose parent is not listed says so: {out}");
+    }
+
+    #[test]
+    fn session_hierarchy_survives_narrow_terminals() {
+        let mut app = App::new(snapshot(codex_family()));
+        app.selected_id = Some("session-review".into());
+        app.rebuild_rows();
+        let theme = Theme::new(ThemeMode::Dark, true);
+        for width in [0, 1, 8, 20, 40] {
+            let _ = tree_detail(&app, app.selected_agent().unwrap(), width, &theme);
+        }
+        for (width, height) in [(20, 8), (40, 16), (80, 24)] {
+            let _ = render(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn no_lineage_keeps_the_existing_process_view() {
+        let app = App::new(snapshot(vec![agent("standalone", Vec::new())]));
+        let selected = app.selected_agent().unwrap();
+        assert_eq!(table_session_name(selected, 0), "standalone");
+        let text = tree_detail(&app, selected, 120, &Theme::new(ThemeMode::Dark, true)).to_string();
+        assert!(text.starts_with("process tree"));
+        assert!(!text.contains("session tree"));
+        assert!(!text.contains("CPU/RSS shared"));
     }
 
     fn snapshot(agents: Vec<Agent>) -> Snapshot {
@@ -1526,6 +1747,24 @@ mod tests {
         for dx in 0..text.chars().count() as u16 {
             let cell = &buf[(x + dx, y)];
             assert_eq!((cell.fg, cell.bg), (foreground, background), "{text:?} at ({}, {y})", x + dx);
+        }
+    }
+
+    #[test]
+    fn both_themes_style_session_hierarchy_and_shared_processes() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            for truecolor in [true, false] {
+                let theme = Theme::new(mode, truecolor);
+                let mut app = App::new(snapshot(codex_family()));
+                app.selected_id = Some("session-scout".into());
+                app.rebuild_rows();
+                let buf = render_buffer(&mut app, 180, 48, &theme);
+
+                assert_text_style(&buf, "CPU/RSS shared by sessions", theme.dim, theme.background);
+                assert_text_style(&buf, "process tree", theme.accent, theme.background);
+                assert_text_style(&buf, "[agent]", theme.green, theme.background);
+                assert_text_style(&buf, "nickname", theme.dim, theme.background);
+            }
         }
     }
 
@@ -1798,6 +2037,36 @@ mod tests {
         app.detail = DetailView::Tree;
         let out = render(&mut app, 120, 40);
         assert!(out.lines().any(|l| l.contains("exec_command") && l.contains("2.5k        -")), "{out}");
+    }
+
+    #[test]
+    fn codex_nested_tools_appear_in_tree_context() {
+        use agent_top_core::harness::{SessionTracker, codex::CodexTranscript};
+        let path = std::env::temp_dir().join(format!("agent-top-codex-context-ui-{}.jsonl", std::process::id()));
+        std::fs::write(&path, r#"{"timestamp":"1970-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper-1"}}
+{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1250,"completed_at_ms":1500,"item":{"type":"CommandExecution","id":"exec-command","source":"unified_exec_startup","formatted_output":"abc"}}}
+{"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1600,"completed_at_ms":1700,"item":{"type":"FileChange","id":"exec-patch","stdout":"d"}}}
+{"timestamp":"1970-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-1"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000}}}}
+{"timestamp":"1970-01-01T00:00:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1100}}}}
+"#).unwrap();
+        let mut transcript = CodexTranscript::new(&path);
+        transcript.refresh().unwrap();
+        let _ = std::fs::remove_file(path);
+        let mut a = agent("code-mode", Vec::new());
+        a.harness = agent_top_core::Harness::Codex;
+        a.price_source = None;
+        a.context = transcript.summary().context.sources();
+        let mut app = App::new(snapshot(vec![a]));
+        app.show_detail = true;
+        app.detail = DetailView::Tree;
+        let out = render(&mut app, 180, 48);
+        assert!(out.contains("context"), "{out}");
+        assert!(!out.contains("estimated"), "{out}");
+        for (name, values) in [("apply_patch", "1      25        -"), ("exec_command", "1      75        -")] {
+            assert!(out.lines().any(|l| l.contains(name) && l.contains(values)), "{out}");
+        }
     }
 
     #[test]

@@ -24,9 +24,10 @@ about which ones are exact and which are inferred.
   a platform where it cannot, the match falls back to working directory and
   start time, and the detail pane labels that row a heuristic rather than
   presenting it as fact.
-- **Only metadata is read.** Token counts, model ids, tool names, timestamps.
-  Never a prompt, a tool input, or a tool result. Even the size of a tool
-  result is inferred from how much the next prompt grew, not read from it
+- **Metadata and output sizes only.** Token counts, model ids, tool names,
+  timestamps, and local byte lengths of Codex nested-tool output text.
+  Prompts and tool inputs are not inspected. Output text is measured, never
+  retained or exported; only numeric weights survive parsing
   (see [Context by source](#context-by-source)).
 - **Your data never leaves the machine.** `agent-top` never kills or writes to an
   agent, and it never sends your sessions, prompts, costs or process list
@@ -40,8 +41,9 @@ about which ones are exact and which are inferred.
 ## Context by source
 
 The detail pane's `context` section says what each tool's results added to the
-prompt and what carrying that has cost. It is derived, not read: no harness
-records the size of a tool result, and agent-top does not read the result.
+prompt and what carrying that has cost. Token sizes are derived from usage
+records, not counted from result text. Codex nested-tool output sizes provide
+relative weights, not additional tokens.
 
 **Tokens.** A response's prompt is the previous response's prompt plus
 everything appended since: the previous reply, and the tool results that
@@ -49,9 +51,32 @@ answered it. So `prompt(n) − prompt(n−1)` is the new material; the previous
 reply's `output` is the part the model wrote itself; the remainder is the tool
 results submitted in between, and it is filed under the tools that produced
 them. When several results were answered by one response the growth is split
-evenly between them, which is a heuristic and the one place the figure is not
-exact. The first response's whole prompt, the replies, and any growth that no
-result explains (your own messages) go to one row, `prompts & replies`.
+evenly between them, so per-source figures are not exact. The first response's
+whole prompt, the replies, and any growth that no result explains (your own
+messages) go to one row, `prompts & replies`.
+
+**Codex response ordering.** Some versions log tool results before the usage
+of the response that requested them. Those results wait for the following,
+consuming response; they do not receive the initial prompt's tokens. Repeated
+usage snapshots do not consume queued results or add cost.
+
+**Codex code mode.** Recognised nested tools whose timing fits entirely inside
+one wrapper share that wrapper's allocation. This link is a timing heuristic;
+unknown calls, invalid timing or overlapping wrappers keep `exec` (or `wait`).
+Each wrapper output contributes once, regardless of its number of children.
+
+Children are weighted by decoded UTF-8 output-text bytes: formatted command
+output (falling back to aggregate output or stdout/stderr), patch stdout/stderr,
+and text-only MCP or dynamic-tool results. Arguments, patch diffs, JSON envelope
+keys and duplicate output fields do not contribute. If any size is unavailable
+(including structured or non-text results), or all outputs are empty, children
+split evenly. Rounding preserves the wrapper's exact allocation; the `calls`
+column counts the nested calls, not an additional wrapper call.
+
+This is a heuristic, not exact per-tool token usage. A wrapper can filter,
+combine or discard child output, and byte lengths are not tokenizer counts.
+No output text is retained or exported, and session token and cost totals are
+unchanged.
 
 **Cost.** Every response re-reads the whole context, so each source's tokens
 are charged at every response that read them, at that response's own prompt

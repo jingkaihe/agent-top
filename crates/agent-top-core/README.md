@@ -37,8 +37,10 @@ later.
 
 **Discovery.** Walks the process table with `sysinfo` and identifies Claude
 Code, Codex, Gemini CLI, OpenCode, Aider, Copilot CLI and cursor-agent
-processes. Child processes are folded into a tree and labelled as subagents, MCP
-servers, shells or tools. An MCP server whose agent has exited is reported as an
+processes. Child processes are folded into a tree and labelled as agents, MCP
+servers, shells or tools. Codex logical subagents are identified separately from
+explicit transcript parent-session metadata, never from process ancestry.
+An MCP server whose agent has exited is reported as an
 orphan, which is a common way for these tools to leak memory.
 
 **Attribution.** Matches each process to its transcript file. Where a harness
@@ -64,8 +66,9 @@ keeps the newest 128 spans; to read a whole transcript, open it with
 `refresh_all`, which is what `agent-top trace` does.
 
 Everything is read only and stays on the machine. The library makes no network
-calls, never signals or writes to an agent, and reads metadata fields only,
-never the content of prompts or tool output.
+calls and never signals or writes to an agent. It reads metadata and measures
+Codex nested-tool output text for relative byte weights, retaining only sizes.
+Prompts and tool inputs are not inspected; output text is never retained or exported.
 
 ## Stability
 

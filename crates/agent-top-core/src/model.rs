@@ -278,10 +278,10 @@ pub struct ContextSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProcKind {
-    /// The agent's root process (the harness itself).
+    /// A harness process, whether at the root or nested under another process.
+    /// Older snapshots called nested harness processes `subagent`.
+    #[serde(alias = "subagent")]
     Agent,
-    /// Another agent process nested under an agent (e.g. `claude -p` run from a tool).
-    Subagent,
     /// A Model Context Protocol server or helper.
     Mcp,
     /// A shell spawned to run a tool call.
@@ -294,7 +294,6 @@ impl ProcKind {
     pub fn label(self) -> &'static str {
         match self {
             ProcKind::Agent => "agent",
-            ProcKind::Subagent => "subagent",
             ProcKind::Mcp => "mcp",
             ProcKind::Shell => "shell",
             ProcKind::Tool => "tool",
@@ -367,6 +366,17 @@ impl ProcNode {
     }
 }
 
+/// A logical subagent relationship explicitly recorded by the harness.
+/// This is session lineage, not an OS process relationship or a history fork.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentInfo {
+    pub parent_session_id: String,
+    #[serde(default)]
+    pub nickname: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
 /// A single row in the agent table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
@@ -378,6 +388,10 @@ pub struct Agent {
     pub activity: Activity,
     pub pid: Option<u32>,
     pub session_id: Option<String>,
+    /// Explicit logical parent and identity, when the transcript records them.
+    /// Usage remains per session; adding hierarchy must not count it twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentInfo>,
     pub session_path: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub model: Option<String>,

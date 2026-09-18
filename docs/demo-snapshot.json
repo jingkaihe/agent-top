@@ -745,7 +745,7 @@
       "ppid": 7161,
       "name": "claude",
       "cmdline": "claude -p review the diff",
-      "kind": "subagent",
+      "kind": "agent",
       "harness": "claude",
       "cpu_percent": 2.0,
       "rss_bytes": 220200960,

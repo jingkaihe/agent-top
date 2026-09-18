@@ -21,10 +21,10 @@ Coding agents have become long-running processes, and you tend to keep several a
 ## Key features
 
 - **[Every harness in one view](https://agenttop.dev/live-view/).** Claude Code, Codex, Gemini CLI and OpenCode sessions in a single table, live or recently stopped, so you never tab between four tools to see what is running.
-- **[Real tokens and cost](https://agenttop.dev/accounting/).** Counted from the harness's own transcript, never estimated, and priced from a table you can read and edit (Anthropic, OpenAI and Google list prices). Subagents are folded into their parent.
+- **[Real tokens and cost](https://agenttop.dev/accounting/).** Counted from the harness's own transcript, never estimated, and priced from a table you can read and edit (Anthropic, OpenAI and Google list prices). Codex subagent sessions are grouped by their recorded parent, with usage kept separate.
 - **[`agent-top report`](#what-it-all-costs-agent-top-report).** What all of it has cost, across every harness, from the transcripts on disk, grouped by harness, model, project or day. The one place that adds your agent spend up together.
 - **MCP leak detection.** One row per MCP server with its call count, and orphaned servers, a memory leak agent-top watches for on every tick, flagged in red with the agent they were orphaned from.
-- **[Context by source](https://agenttop.dev/accounting/#context-by-source).** Which tool's results are filling the prompt, and what re-reading them on every response since has cost: a `Read` that returned 40k tokens is billed again on every turn for the rest of the session, and no harness shows that. Computed from the usage records alone; no tool output is read.
+- **[Context by source](https://agenttop.dev/accounting/#context-by-source).** Which tool's results are filling the prompt, and what re-reading them on every response since has cost: a `Read` that returned 40k tokens is billed again on every turn for the rest of the session, and no harness shows that. Computed from the usage records. The one thing taken from a tool result is its length, for Codex code mode, and no output text is kept.
 - **[Tool trace, and OpenTelemetry export](https://agenttop.dev/trace/).** A waterfall of every tool call, inference and turn, reconstructed from the transcript with no telemetry to switch on. Export it as a Chrome trace for Perfetto, or as OTLP JSON, and `trace --endpoint <url>` posts it straight to Jaeger, Tempo or any OpenTelemetry collector.
 - **Signals the harnesses hide.** How close each agent is to its rate limit (Codex), how much of each prompt is served from cheap cache versus paid at full price, and your live spend velocity in dollars-per-hour across every agent at once.
 - **Read-only and self-contained.** Reads the files the harnesses already write and the process table the OS already keeps. No daemon, no configuration, one static binary; it never writes to or kills an agent, and your data never leaves the machine. The only network calls it makes carry none of your data: a daily update check (turn off with `AGENT_TOP_NO_UPDATE_CHECK=1`) and the `trace --endpoint` you type.
@@ -81,8 +81,11 @@ and, for Claude Code, priced.
 
 Press `t` to open it and `Tab` to switch between two views.
 
-**Process tree.** Every process under the agent, labelled `agent`, `subagent`,
-`mcp`, `shell` or `tool`, with the token breakdown beside it.
+**Process tree.** Every process under the agent, labelled `agent`, `mcp`,
+`shell` or `tool`, with the token breakdown beside it. A nested agent process is
+not assumed to be a subagent. Codex subagents are sessions inside one process:
+the table nests them beneath their parent, each with its own usage, and the
+shared process memory is counted once.
 
 **MCP servers.** Below the tree, one line per MCP server the agent uses: the
 server's pid, how many times the agent has called it, how many of those calls
@@ -122,8 +125,9 @@ The tokens are the growth of the prompt between one response and the next,
 attributed to the tool results submitted in between (split evenly when several
 were answered together, which is a heuristic); the cost is those tokens at each
 later response's own prompt rate, mostly the cache-read price. The rows sum to
-the session's prompt-side cost. Nothing is read from a tool result itself,
-only how much bigger the next prompt was. See
+the session's prompt-side cost. Codex code-mode wrappers divide their share
+between nested tools using output-text byte lengths, falling back to an even
+split when sizes are unavailable. Only sizes are retained, not output text. See
 [accounting.md](docs/accounting.md#context-by-source) for the arithmetic and
 its limits. `agent-top --once` lists the top sources per agent under
 `CONTEXT BY SOURCE`; `--json` carries them all as `context`.
@@ -483,8 +487,9 @@ which are exact and which are inferred. In short:
   shown as a floor, never guessed at.
 - **Attribution says how sure it is** — exact from a registry or an open file,
   or labelled a heuristic when it falls back to working directory and start time.
-- **Only metadata is read**, and **nothing is written, signalled, or sent** (bar
-  the one `--endpoint` you type).
+- **Only metadata and Codex nested-output sizes are used**; no prompt or tool
+  input is inspected and no output text retained. **Nothing is written,
+  signalled, or sent** (bar the one `--endpoint` you type).
 
 The full account, including a worked example of why agent-top and your harness
 can disagree on cost and how to reconcile them, is

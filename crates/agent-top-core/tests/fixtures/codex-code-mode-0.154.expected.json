@@ -1,0 +1,141 @@
+{
+  "activity": "Waiting",
+  "context": [
+    {
+      "calls": 27,
+      "cost_usd_micros": 14720,
+      "name": "exec_command",
+      "origin": "Tool",
+      "tokens": 68072
+    },
+    {
+      "calls": 0,
+      "cost_usd_micros": 15988,
+      "name": "other",
+      "origin": "Other",
+      "tokens": 46130
+    },
+    {
+      "calls": 1,
+      "cost_usd_micros": 0,
+      "name": "exec",
+      "origin": "Tool",
+      "tokens": 9117
+    },
+    {
+      "calls": 8,
+      "cost_usd_micros": 7,
+      "name": "apply_patch",
+      "origin": "Tool",
+      "tokens": 156
+    }
+  ],
+  "cost_breakdown_micros": {
+    "cache_read": 41664,
+    "cache_write_1h": 0,
+    "cache_write_5m": 0,
+    "input": 36172,
+    "output": 21480,
+    "web_search": 0
+  },
+  "cost_usd_micros": 99316,
+  "cwd": "/tmp/p",
+  "harness_version": "0.154.0",
+  "last_activity_ms": 1789581785521,
+  "mcp": [],
+  "model": "gpt-5.6-luna",
+  "rate_limit": {
+    "plan": "plus",
+    "primary_pct": 0.0,
+    "reached": false,
+    "secondary_pct": 0.0
+  },
+  "session_id": "01000000-0000-7000-0000-000000000154",
+  "spans": {
+    "by_kind": [
+      {
+        "count": 64,
+        "kind": "tool",
+        "open": 0,
+        "total_duration_ms": 5655
+      },
+      {
+        "count": 31,
+        "kind": "inference",
+        "open": 0,
+        "total_duration_ms": 106625
+      },
+      {
+        "count": 4,
+        "kind": "turn",
+        "open": 0,
+        "total_duration_ms": 367054
+      }
+    ],
+    "count": 99,
+    "errors": 0,
+    "first": [
+      {
+        "duration_ms": 11948,
+        "error": false,
+        "kind": "turn",
+        "name": "turn",
+        "sidechain": false
+      },
+      {
+        "duration_ms": 2020,
+        "error": false,
+        "kind": "inference",
+        "name": "inference",
+        "sidechain": false
+      },
+      {
+        "duration_ms": 149,
+        "error": false,
+        "kind": "tool",
+        "name": "exec",
+        "sidechain": false
+      }
+    ],
+    "last": [
+      {
+        "duration_ms": 569,
+        "error": false,
+        "kind": "turn",
+        "name": "turn",
+        "sidechain": false
+      },
+      {
+        "duration_ms": 4906,
+        "error": false,
+        "kind": "inference",
+        "name": "inference",
+        "sidechain": false
+      },
+      {
+        "duration_ms": 0,
+        "error": false,
+        "kind": "tool",
+        "name": "exec_command",
+        "sidechain": false
+      }
+    ],
+    "open": 0,
+    "sidechain": 0,
+    "total_duration_ms": 479334
+  },
+  "started_at_ms": 1789580935741,
+  "subagent_turns": 0,
+  "tool_calls": 64,
+  "turns": 10,
+  "unpriced_tokens": 0,
+  "usage": {
+    "cache_read": 2083200,
+    "cache_write_1h": 0,
+    "cache_write_5m": 0,
+    "input": 180859,
+    "output": 17900,
+    "total": 2281959
+  },
+  "web_searches": 0
+}

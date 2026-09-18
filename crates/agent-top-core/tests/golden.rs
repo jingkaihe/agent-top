@@ -175,3 +175,15 @@ fn codex_mcp_0_152() {
     let p = fixtures().join("codex-mcp-0.152.jsonl");
     check("codex-mcp-0.152", Box::new(CodexTranscript::new(p).with_prices(pricing::builtin_table())));
 }
+
+/// A redacted real Codex 0.154 session in code mode: 28 `exec` wrappers with
+/// 28 commands and 8 patches recorded inside them as `item_completed`, seven
+/// wrappers holding several tools (so the byte weights decide the split), one
+/// holding an unrecognised `Extension` item (so it keeps the name `exec`), and
+/// `token_count` written after each tool output rather than before it. Output
+/// text is filler of the original byte length; the lengths are the real data.
+#[test]
+fn codex_code_mode_0_154() {
+    let p = fixtures().join("codex-code-mode-0.154.jsonl");
+    check("codex-code-mode-0.154", Box::new(CodexTranscript::new(p).with_prices(pricing::builtin_table())));
+}

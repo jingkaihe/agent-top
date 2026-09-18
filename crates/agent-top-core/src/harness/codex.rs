@@ -17,21 +17,48 @@
 //!   `web_search_call`, or an assistant `message`.
 //! * `response_item` `web_search_call` is one server-side web search.
 //! * `info.last_token_usage` beside the cumulative record is the one
-//!   response's usage. The first `token_count` of a turn repeats the
-//!   previous turn's last one, so a record identical to the one before it
-//!   is a snapshot, not a response. Context by source is sized from these:
-//!   each `*_output` item is filed under its call's name, re-filed under
-//!   the MCP server when the `mcp_tool_call_end` for that call id follows
-//!   (it comes after the output), and sized by the next response. Codex
+//!   response's usage. Repeated cumulative usage marks a snapshot; equal
+//!   per-response usage alone need not. Each `*_output` item is filed under
+//!   its call's name, re-filed under the MCP server when its
+//!   `mcp_tool_call_end` follows, and sized by the consuming response. Codex
 //!   writes no compaction marker that was seen, so the ledger's halving
 //!   rule stands in. See `ContextLedger`.
+//! * Usage ordering (0.130 fixture / 0.154.0 live and source, 2026-09-18):
+//!   newer versions emit `token_count` after draining tool outputs, older
+//!   ones before. The first model item freezes that response's input batch;
+//!   results produced during it wait for the next response.
 //!
 //! Codex model prices are not in the static table, so cost is reported as
 //! unpriced tokens.
+//!
+//! Process semantics (source-verified against Codex 0.154.0, 2026-09-17):
+//! the npm launcher spawns a native runtime, which owns the rollout handles.
+//! Native `spawn_agent` creates an in-process session, not an OS process.
+//! Its lineage is `payload.source.subagent.thread_spawn.parent_thread_id` in
+//! session metadata, or `payload.parent_thread_id` when `thread_source` is
+//! explicitly `subagent`, never a PID relationship or `forked_from_id`.
+//! Nickname and role come from that source record (or the top-level metadata);
+//! older records name the role `agent_type`. Rollouts retain separate usage
+//! totals while the TUI groups them by parent. Memory belongs to the process,
+//! not to individual logical subagents sharing that process.
+//! Live 0.154.0 rollouts (2026-09-17) can copy ancestor `session_meta` records
+//! after the child's own header when forking history. The first identified
+//! header owns this rollout's identity and lineage; later headers do not.
+//!
+//! Code mode (live/source verified on 0.154.0, 2026-09-18): `exec` wraps
+//! nested tools recorded as `event_msg/item_completed`, with `exec-<uuid>`
+//! ids and `started_at_ms`/`completed_at_ms`. Typed metadata supplies names;
+//! unknown types are ignored. Counts include wrappers and nested calls;
+//! each wrapper's context share is split between its contained children by
+//! output-text bytes (evenly if sizes are unavailable). Only sizes are retained;
+//! no prompts or inputs are inspected. Ambiguous wrappers keep their name.
 
-use super::{AttributeContext, HarnessAdapter, REFRESH_BUDGET_BYTES, SessionSummary, SessionTracker, SpanRetention, parse_rfc3339_utc};
+use super::{
+    AttributeContext, ContextWeights, HarnessAdapter, REFRESH_BUDGET_BYTES, SessionSummary, SessionTracker, SpanRetention,
+    parse_rfc3339_utc,
+};
 use crate::jsonl::TailReader;
-use crate::model::{Activity, Attribution, ContextOrigin, Harness, ProcNode, SpanKind, TokenUsage};
+use crate::model::{Activity, Attribution, ContextOrigin, Harness, ProcNode, SpanKind, SubagentInfo, TokenUsage};
 use crate::pricing::{self, Table};
 use crate::process::RawProc;
 use serde_json::Value;
@@ -68,6 +95,17 @@ pub fn rollouts_open_by(pid: u32) -> Option<Vec<PathBuf>> {
             .filter_map(|p| p.strip_prefix(&canonical).ok().map(|rel| root.join(rel)))
             .collect(),
     )
+}
+
+/// An npm launcher holds no rollouts; its native runtime does. Match the
+/// forwarded argv, never just an `Agent` child: a nested agent invocation
+/// owns its own sessions even though it is beneath this process.
+fn rollout_owner<'a>(root: &'a ProcNode, by_pid: &HashMap<u32, &RawProc>) -> &'a ProcNode {
+    let Some(parent) = by_pid.get(&root.pid) else { return root };
+    root.children
+        .iter()
+        .find(|p| p.harness == Some(Harness::Codex) && by_pid.get(&p.pid).is_some_and(|child| child.is_codex_runtime_of(parent)))
+        .unwrap_or(root)
 }
 
 /// Every rollout written since `since`.
@@ -143,8 +181,8 @@ impl HarnessAdapter for CodexAdapter {
         self.recent = recent_rollouts(since).into_iter().filter_map(|p| read_meta(&p).map(|(cwd, ts)| (p, cwd, ts))).collect();
     }
 
-    fn prepare(&mut self, roots: &[&ProcNode]) {
-        self.held = roots.iter().map(|r| (r.pid, rollouts_open_by(r.pid))).collect();
+    fn prepare(&mut self, roots: &[&ProcNode], by_pid: &HashMap<u32, &RawProc>) {
+        self.held = roots.iter().map(|r| (r.pid, rollouts_open_by(rollout_owner(r, by_pid).pid))).collect();
         self.all_held = self.held.values().flatten().flatten().cloned().collect();
     }
 
@@ -252,6 +290,25 @@ fn written_at(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
+fn subagent_info(meta: &Value) -> Option<SubagentInfo> {
+    let source = meta.pointer("/source/subagent/thread_spawn");
+    let parent = source.and_then(|s| s.get("parent_thread_id")).and_then(Value::as_str).or_else(|| {
+        (meta.get("thread_source").and_then(Value::as_str) == Some("subagent"))
+            .then(|| meta.get("parent_thread_id").and_then(Value::as_str))
+            .flatten()
+    })?;
+    let id = meta.get("id").or_else(|| meta.get("session_id")).and_then(Value::as_str);
+    if parent.is_empty() || Some(parent) == id {
+        return None;
+    }
+    let field = |key| source.and_then(|s| s.get(key)).and_then(Value::as_str).or_else(|| meta.get(key).and_then(Value::as_str));
+    Some(SubagentInfo {
+        parent_session_id: parent.to_string(),
+        nickname: field("agent_nickname").map(str::to_string),
+        role: field("agent_role").or_else(|| field("agent_type")).map(str::to_string),
+    })
+}
+
 pub struct CodexTranscript {
     reader: TailReader,
     prices: &'static Table,
@@ -264,9 +321,60 @@ pub struct CodexTranscript {
     inference: Option<String>,
     /// Tool calls awaiting their output, by call id, so the output can be
     /// filed under the call's name.
-    pending_tools: HashMap<String, String>,
-    /// The last per-response usage seen, to skip the repeated snapshot.
-    last_response: Option<TokenUsage>,
+    pending_tools: HashMap<String, PendingTool>,
+    /// Completed results awaiting the next model response.
+    context_results: Vec<(String, ContextWeights)>,
+    response_in_progress: bool,
+    /// Per-response and cumulative usage, to skip repeated snapshots.
+    last_response: Option<(TokenUsage, Option<TokenUsage>)>,
+}
+
+struct PendingTool {
+    name: String,
+    started_at: SystemTime,
+    nested: Vec<NestedSource>,
+    ambiguous: bool,
+    active: bool,
+}
+
+struct NestedSource {
+    id: String,
+    origin: ContextOrigin,
+    name: String,
+    ended_at: SystemTime,
+    output_bytes: Option<u64>,
+}
+
+/// Measure decoded output text, never command arguments or patch contents.
+fn nested_output_bytes(item: &Value) -> Option<u64> {
+    let text = |key| item.get(key).and_then(Value::as_str).map(|s| s.len() as u64);
+    let streams = || match (text("stdout"), text("stderr")) {
+        (None, None) => None,
+        (out, err) => Some(out.unwrap_or(0) + err.unwrap_or(0)),
+    };
+    match item.get("type").and_then(Value::as_str)? {
+        "CommandExecution" => text("formatted_output").or_else(|| text("aggregated_output")).or_else(streams),
+        "FileChange" => streams(),
+        "McpToolCall" => match item.get("result").filter(|v| !v.is_null()) {
+            Some(result) if result.get("structuredContent").is_some_and(|v| !v.is_null()) => None,
+            Some(result) => text_content_bytes(result.get("content")?, "text"),
+            None => item.pointer("/error/message").and_then(Value::as_str).map(|s| s.len() as u64),
+        },
+        "DynamicToolCall" => match item.get("content_items").filter(|v| !v.is_null()) {
+            Some(content) => text_content_bytes(content, "inputText"),
+            None => text("error"),
+        },
+        _ => None,
+    }
+}
+
+fn text_content_bytes(content: &Value, kind: &str) -> Option<u64> {
+    content.as_array()?.iter().try_fold(0, |total, item| {
+        if item.get("type").and_then(Value::as_str) != Some(kind) {
+            return None;
+        }
+        Some(total + item.get("text")?.as_str()?.len() as u64)
+    })
 }
 
 impl CodexTranscript {
@@ -280,6 +388,8 @@ impl CodexTranscript {
             turn: None,
             inference: None,
             pending_tools: HashMap::new(),
+            context_results: Vec::new(),
+            response_in_progress: false,
             last_response: None,
         }
     }
@@ -320,6 +430,63 @@ impl CodexTranscript {
         self
     }
 
+    /// Nested `exec-<uuid>` calls lack response_item pairs; direct calls already
+    /// have spans and must not be counted again.
+    fn nested_tool_completed(&mut self, payload: &Value) {
+        let Some(item) = payload.get("item") else { return };
+        let Some(id) = item.get("id").and_then(Value::as_str).filter(|id| id.starts_with("exec-") && id.len() > 5) else {
+            return;
+        };
+        if self.summary.spans.iter().any(|s| s.id == id) || self.pending_tools.values().any(|p| p.nested.iter().any(|n| n.id == id)) {
+            return;
+        }
+        let name = match item.get("type").and_then(Value::as_str) {
+            Some("CommandExecution") => match item.get("source").and_then(Value::as_str) {
+                Some("unified_exec_startup") => Some("exec_command"),
+                Some("unified_exec_interaction") => Some("write_stdin"),
+                _ => None,
+            },
+            Some("FileChange") => Some("apply_patch"),
+            Some("McpToolCall" | "DynamicToolCall") => item.get("tool").and_then(Value::as_str).filter(|s| !s.is_empty()),
+            _ => None,
+        };
+        let time =
+            |key| payload.get(key).and_then(Value::as_u64).and_then(|ms| SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms)));
+        let (start, end) = (time("started_at_ms"), time("completed_at_ms"));
+        let source = match (name, item.get("type").and_then(Value::as_str)) {
+            (Some(_), Some("McpToolCall")) => {
+                item.get("server").and_then(Value::as_str).filter(|s| !s.is_empty()).map(|server| (ContextOrigin::Mcp, server))
+            }
+            (Some(name), _) => Some((ContextOrigin::Tool, name)),
+            _ => None,
+        };
+        // Timing is a heuristic; keep ambiguous results under the wrapper.
+        for pending in self.pending_tools.values_mut().filter(|p| p.active && matches!(p.name.as_str(), "exec" | "wait")) {
+            match (source, start, end) {
+                (Some((origin, name)), Some(start), Some(end)) if start >= pending.started_at && end >= start => {
+                    pending.nested.push(NestedSource {
+                        id: id.into(),
+                        origin,
+                        name: name.into(),
+                        ended_at: end,
+                        output_bytes: nested_output_bytes(item),
+                    });
+                }
+                _ => pending.ambiguous = true,
+            }
+        }
+        let (Some(name), Some(start), Some(end)) = (name, start, end) else { return };
+        if end < start {
+            return;
+        }
+        let error = matches!(item.get("status").and_then(Value::as_str), Some("failed" | "declined"))
+            || item.get("exit_code").and_then(Value::as_i64).is_some_and(|code| code != 0)
+            || item.get("success").and_then(Value::as_bool) == Some(false);
+        self.summary.tool_calls += 1;
+        self.summary.spans.open(id.to_string(), name.to_string(), start, false);
+        self.summary.spans.close(id, end, error);
+    }
+
     fn ingest(&mut self, line: &str) {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return };
         let ts = v.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_utc);
@@ -332,10 +499,25 @@ impl CodexTranscript {
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
         let payload = v.get("payload");
         let ptype = payload.and_then(|p| p.get("type")).and_then(Value::as_str).unwrap_or("");
+        if !self.response_in_progress
+            && kind == "response_item"
+            && (matches!(
+                ptype,
+                "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call" | "web_search_call" | "reasoning"
+            ) || (ptype == "message" && payload.and_then(|p| p.get("role")).and_then(Value::as_str) == Some("assistant")))
+        {
+            for (id, sources) in self.context_results.drain(..) {
+                self.summary.context.result_weighted(&id, sources);
+            }
+            self.response_in_progress = true;
+        }
         match kind {
-            "session_meta" => {
+            // Forked history can contain parent headers, including across tail
+            // refreshes. They must not replace this rollout's own metadata.
+            "session_meta" if self.summary.session_id.is_none() => {
                 if let Some(p) = payload {
                     self.summary.session_id = p.get("id").or(p.get("session_id")).and_then(Value::as_str).map(str::to_string);
+                    self.summary.subagent = subagent_info(p);
                     self.summary.cwd = p.get("cwd").and_then(Value::as_str).map(PathBuf::from);
                     self.summary.harness_version = p.get("cli_version").and_then(Value::as_str).map(str::to_string);
                 }
@@ -347,7 +529,8 @@ impl CodexTranscript {
             }
             "event_msg" => match ptype {
                 "token_count" => {
-                    if let Some(total) = payload.and_then(|p| p.pointer("/info/total_token_usage")) {
+                    let total = payload.and_then(|p| p.pointer("/info/total_token_usage")).filter(|v| v.is_object());
+                    if let Some(total) = total {
                         let g = |k: &str| total.get(k).and_then(Value::as_u64).unwrap_or(0);
                         self.summary.health.usage_records += 1;
                         if g("input_tokens") + g("output_tokens") + g("cached_input_tokens") == 0 {
@@ -375,7 +558,7 @@ impl CodexTranscript {
                             }
                         }
                     }
-                    if let Some(last) = payload.and_then(|p| p.pointer("/info/last_token_usage")) {
+                    if let Some(last) = payload.and_then(|p| p.pointer("/info/last_token_usage")).filter(|v| v.is_object()) {
                         let g = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
                         let cached = g("cached_input_tokens");
                         let usage = TokenUsage {
@@ -384,7 +567,8 @@ impl CodexTranscript {
                             output: g("output_tokens"),
                             ..Default::default()
                         };
-                        if self.last_response != Some(usage) {
+                        let response = (usage, total.map(|_| self.summary.usage));
+                        if usage.prompt() > 0 && self.last_response != Some(response) {
                             let cost = self
                                 .summary
                                 .model
@@ -393,7 +577,8 @@ impl CodexTranscript {
                                 .map(|p| p.breakdown(&usage))
                                 .unwrap_or_default();
                             self.summary.context.response(&usage, &cost);
-                            self.last_response = Some(usage);
+                            self.last_response = Some(response);
+                            self.response_in_progress = false;
                         }
                     }
                     // The rate-limit snapshot rides on every token_count; the
@@ -412,6 +597,11 @@ impl CodexTranscript {
                     }
                 }
                 "user_message" => self.summary.activity = Activity::Working,
+                "item_completed" => {
+                    if let Some(p) = payload {
+                        self.nested_tool_completed(p);
+                    }
+                }
                 // An MCP tool call. Codex records the call as a `response_item`
                 // `function_call` too, which the block below counts as a tool
                 // call and turns into a span; this line is the only one that
@@ -433,7 +623,14 @@ impl CodexTranscript {
                         u.calls += 1;
                         u.errors += u64::from(error);
                         u.last_call = u.last_call.max(ts);
-                        self.summary.context.retag(&payload.map(call_id).unwrap_or_default(), ContextOrigin::Mcp, server);
+                        let id = payload.map(call_id).unwrap_or_default();
+                        if let Some((_, sources)) = self.context_results.iter_mut().find(|(i, _)| *i == id) {
+                            for (origin, name, _) in sources {
+                                *origin = ContextOrigin::Mcp;
+                                *name = server.to_string();
+                            }
+                        }
+                        self.summary.context.retag(&id, ContextOrigin::Mcp, server);
                     }
                 }
                 "task_complete" | "turn_aborted" | "error" => {
@@ -444,6 +641,12 @@ impl CodexTranscript {
                     if let Some(id) = self.inference.take() {
                         self.summary.spans.discard_open(&id);
                     }
+                    // Keep names for late outputs, not overlap attribution.
+                    for pending in self.pending_tools.values_mut() {
+                        pending.active = false;
+                        pending.ambiguous = true;
+                    }
+                    self.response_in_progress = false;
                 }
                 _ => {}
             },
@@ -454,19 +657,39 @@ impl CodexTranscript {
                         self.end_inference(ts);
                         let id = call_id(p);
                         let name = p.get("name").and_then(Value::as_str).unwrap_or(ptype);
-                        self.pending_tools.insert(id.clone(), name.to_string());
+                        let mut ambiguous = false;
+                        if matches!(name, "exec" | "wait") {
+                            for pending in
+                                self.pending_tools.values_mut().filter(|p| p.active && matches!(p.name.as_str(), "exec" | "wait"))
+                            {
+                                pending.ambiguous = true;
+                                ambiguous = true;
+                            }
+                        }
+                        self.pending_tools.insert(
+                            id.clone(),
+                            PendingTool { name: name.into(), started_at: ts, nested: Vec::new(), ambiguous, active: true },
+                        );
                         self.summary.spans.open(id, name.to_string(), ts, false);
                     }
                 }
                 "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
                     if let (Some(ts), Some(p)) = (ts, payload) {
-                        // Codex reports the result as an opaque string, and
-                        // agent-top does not read tool output, so a failed call
-                        // is not distinguishable from a successful one here.
+                        // Wrapper output text is opaque; errors need typed metadata.
                         let id = call_id(p);
                         self.summary.spans.close(&id, ts, false);
-                        let name = self.pending_tools.remove(&id).unwrap_or_else(|| "tool".into());
-                        self.summary.context.result(&id, ContextOrigin::Tool, &name);
+                        let sources = match self.pending_tools.remove(&id) {
+                            Some(p) if !p.ambiguous && !p.nested.is_empty() && p.nested.iter().all(|n| n.ended_at <= ts) => {
+                                let sized = p.nested.iter().all(|n| n.output_bytes.is_some());
+                                p.nested
+                                    .into_iter()
+                                    .map(|n| (n.origin, n.name, if sized { n.output_bytes.unwrap_or(0) } else { 1 }))
+                                    .collect()
+                            }
+                            Some(p) => vec![(ContextOrigin::Tool, p.name, 1)],
+                            None => vec![(ContextOrigin::Tool, "tool".into(), 1)],
+                        };
+                        self.context_results.push((id, sources));
                         self.begin_inference(ts);
                     }
                 }
@@ -558,6 +781,20 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::time::Duration;
+
+    fn record_response(t: &mut CodexTranscript, input: u64, cached: u64, output: u64) -> String {
+        let line = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+            "last_token_usage":{"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output},
+            "total_token_usage":{
+                "input_tokens":t.summary.usage.prompt() + input,
+                "cached_input_tokens":t.summary.usage.cache_read + cached,
+                "output_tokens":t.summary.usage.output + output,
+            },
+        }}})
+        .to_string();
+        t.ingest(&line);
+        line
+    }
 
     /// The bug this guards: the year and month directories were last touched
     /// when a child directory was created, long before the rollout of
@@ -665,6 +902,131 @@ mod tests {
     }
 
     #[test]
+    fn rollout_owner_follows_the_launcher_runtime_but_not_nested_agents() {
+        let proc = |pid, ppid, cmd: &[&str]| RawProc {
+            pid,
+            ppid,
+            name: cmd[0].into(),
+            exe: None,
+            cmd: cmd.iter().map(|s| (*s).into()).collect(),
+            cwd: None,
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            start_time: 0,
+            run_time: 1,
+        };
+        let procs = [
+            proc(10, None, &["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js", "--yolo"]),
+            proc(11, Some(10), &["codex", "--yolo"]),
+            proc(12, Some(11), &["codex", "exec", "review"]),
+        ];
+        let (roots, _) = crate::process::build_forest(&procs);
+        let by_pid = procs.iter().map(|p| (p.pid, p)).collect();
+        let root = &roots[0];
+        assert_eq!(rollout_owner(root, &by_pid).pid, 11, "read the native runtime's descriptors, not the launcher's");
+        assert_eq!(rollout_owner(&root.children[0], &by_pid).pid, 11, "never claim a nested agent's rollouts");
+        assert_eq!(rollout_owner(&root.children[0].children[0], &by_pid).pid, 12);
+    }
+
+    #[test]
+    fn reads_explicit_subagent_lineage_and_identity() {
+        use serde_json::json;
+
+        let mut t = CodexTranscript::new("unused.jsonl");
+        t.ingest(
+            &json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "child", "session_id": "root", "cli_version": "0.154.0",
+                    "forked_from_id": "history-source",
+                    "source": {"subagent": {"thread_spawn": {
+                        "parent_thread_id": "parent", "depth": 2,
+                        "agent_nickname": "Scout", "agent_role": "explorer"
+                    }}}
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(t.summary.session_id.as_deref(), Some("child"), "thread id wins over root session_id");
+        assert_eq!(
+            t.summary.subagent,
+            Some(SubagentInfo { parent_session_id: "parent".into(), nickname: Some("Scout".into()), role: Some("explorer".into()) })
+        );
+
+        // New metadata also carries explicit lineage at the top level. A bare
+        // parent_thread_id without the subagent source must not be inferred.
+        let meta = json!({"id": "child", "thread_source": "subagent", "parent_thread_id": "parent", "agent_type": "worker"});
+        assert_eq!(
+            subagent_info(&meta),
+            Some(SubagentInfo { parent_session_id: "parent".into(), nickname: None, role: Some("worker".into()) })
+        );
+        let meta = json!({"id": "child", "agent_nickname": "Scout", "source": {"subagent": {"thread_spawn": {
+            "parent_thread_id": "parent", "agent_type": "worker"
+        }}}});
+        assert_eq!(subagent_info(&meta).unwrap().nickname.as_deref(), Some("Scout"));
+        assert_eq!(subagent_info(&meta).unwrap().role.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn inherited_session_headers_do_not_replace_the_rollouts_identity() {
+        use serde_json::json;
+
+        let dir = std::env::temp_dir().join(format!("agent-top-codex-inherited-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("child.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let own = json!({"type": "session_meta", "payload": {
+            "id": "child", "session_id": "parent", "cwd": "/child", "cli_version": "0.154.0",
+            "source": {"subagent": {"thread_spawn": {
+                "parent_thread_id": "parent", "agent_nickname": "Scout", "agent_role": "explorer"
+            }}}
+        }});
+        writeln!(file, "{own}").unwrap();
+        let mut t = CodexTranscript::new(&path);
+        t.refresh().unwrap();
+
+        // Forked history follows the child's own header, possibly across refreshes.
+        for id in ["parent", "grandparent"] {
+            let inherited = json!({"type": "session_meta", "payload": {
+                "id": id, "cwd": "/ancestor", "cli_version": "0.149.0", "source": "cli"
+            }});
+            writeln!(file, "{inherited}").unwrap();
+            t.refresh().unwrap();
+            assert_eq!(t.summary.session_id.as_deref(), Some("child"));
+            assert_eq!(t.summary.cwd.as_deref(), Some(Path::new("/child")));
+            assert_eq!(t.summary.harness_version.as_deref(), Some("0.154.0"));
+            assert_eq!(
+                t.summary.subagent,
+                Some(SubagentInfo { parent_session_id: "parent".into(), nickname: Some("Scout".into()), role: Some("explorer".into()) })
+            );
+        }
+        let usage = json!({"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 42}
+        }}});
+        writeln!(file, "{usage}").unwrap();
+        t.refresh().unwrap();
+        assert_eq!(t.summary.usage.input, 42, "continue reading events after inherited headers");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn never_infers_subagents_from_forks_or_incomplete_metadata() {
+        use serde_json::json;
+
+        for meta in [
+            json!({"id": "child", "source": "cli", "forked_from_id": "parent"}),
+            json!({"id": "child", "parent_thread_id": "parent"}),
+            json!({"id": "child", "source": {"subagent": "review"}}),
+            json!({"id": "child", "source": {"subagent": {"thread_spawn": {"depth": 1}}}}),
+            json!({"id": "child", "source": {"subagent": {"thread_spawn": {"parent_thread_id": ""}}}}),
+            json!({"id": "child", "thread_source": "subagent", "parent_thread_id": "child"}),
+            json!({"id": "child", "source": {"subagent": {"thread_spawn": {"parent_thread_id": 42}}}}),
+        ] {
+            assert_eq!(subagent_info(&meta), None, "{meta}");
+        }
+    }
+
+    #[test]
     fn the_rollout_id_follows_the_timestamp() {
         assert_eq!(
             rollout_id(Path::new("/x/2026/05/14/rollout-2026-05-14T21-37-50-01000000-0000-7000-0000-000000000000.jsonl")),
@@ -745,38 +1107,142 @@ mod tests {
 
     #[test]
     fn sizes_context_per_tool_from_last_token_usage_and_skips_the_repeated_snapshot() {
-        let dir = std::env::temp_dir().join(format!("agent-top-codex-context-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("rollout.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        let count = |input: u64, cached: u64, out: u64| {
-            format!(
-                r#"{{"timestamp":"2026-05-27T09:00:00.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{out}}},"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{out}}}}}}}}}"#
-            )
-        };
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:00.000Z","type":"session_meta","payload":{{"id":"s","cwd":"/tmp"}}}}"#).unwrap();
-        writeln!(f, "{}", count(10_000, 0, 100)).unwrap();
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:01.000Z","type":"response_item","payload":{{"type":"function_call","call_id":"c1","name":"exec_command"}}}}"#).unwrap();
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:01.000Z","type":"response_item","payload":{{"type":"function_call","call_id":"c2","name":"github_fetch_file"}}}}"#).unwrap();
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:02.000Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"c1"}}}}"#).unwrap();
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:02.000Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"c2"}}}}"#).unwrap();
-        // The server is named only after the output was written.
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:00:02.100Z","type":"event_msg","payload":{{"type":"mcp_tool_call_end","call_id":"c2","invocation":{{"server":"codex_apps","tool":"github_fetch_file"}},"result":{{"Ok":{{}}}}}}}}"#).unwrap();
-        // 10_000 + 100 reply + 3_000 of results, half each.
-        writeln!(f, "{}", count(13_100, 12_000, 40)).unwrap();
-        // A new turn re-emits the last record: not a response.
-        writeln!(f, r#"{{"timestamp":"2026-05-27T09:01:00.000Z","type":"event_msg","payload":{{"type":"task_started"}}}}"#).unwrap();
-        writeln!(f, "{}", count(13_100, 12_000, 40)).unwrap();
-        let mut t = CodexTranscript::new(&path).with_prices(pricing::builtin_table());
-        t.refresh().unwrap();
-        let c: HashMap<String, crate::model::ContextSource> =
-            t.summary().context.sources().into_iter().map(|c| (c.name.clone(), c)).collect();
-        assert_eq!(c["exec_command"].tokens, 1_500);
-        assert_eq!((c["codex_apps"].tokens, c["codex_apps"].origin), (1_500, ContextOrigin::Mcp));
-        assert!(!c.contains_key("github_fetch_file"), "re-filed under its server");
-        assert_eq!(c["other"].tokens, 10_100, "the repeated snapshot added nothing");
-        assert_eq!(c["other"].cost_usd, 0.0, "no price for the model: tokens only");
-        let _ = std::fs::remove_dir_all(&dir);
+        for delayed in [false, true] {
+            let mut t = CodexTranscript::new("unused.jsonl").with_prices(pricing::builtin_table());
+            t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"exec_command"}}"#);
+            t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c2","name":"github_fetch_file"}}"#);
+            if !delayed {
+                record_response(&mut t, 10_000, 0, 100);
+            }
+            t.ingest(
+                r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}"#,
+            );
+            t.ingest(
+                r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c2"}}"#,
+            );
+            t.ingest(r#"{"type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"c2","invocation":{"server":"codex_apps","tool":"github_fetch_file"},"result":{"Ok":{}}}}"#);
+            if delayed {
+                record_response(&mut t, 10_000, 0, 100);
+            }
+            let initial = t.summary.context.sources();
+            assert_eq!(initial.len(), 1);
+            assert_eq!((initial[0].name.as_str(), initial[0].tokens), ("other", 10_000));
+
+            t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+            let snapshot = record_response(&mut t, 13_100, 12_000, 40);
+            t.ingest(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#);
+            t.ingest(&snapshot);
+            let c: HashMap<_, _> = t.summary.context.sources().into_iter().map(|c| (c.name.clone(), c)).collect();
+            assert_eq!((c["exec_command"].calls, c["exec_command"].tokens), (1, 1_500));
+            assert_eq!((c["codex_apps"].calls, c["codex_apps"].tokens, c["codex_apps"].origin), (1, 1_500, ContextOrigin::Mcp));
+            assert!(!c.contains_key("github_fetch_file"));
+            assert_eq!(c["other"].tokens, 10_100);
+            assert_eq!(c["other"].cost_usd, 0.0);
+        }
+    }
+
+    #[test]
+    fn delayed_usage_charges_only_results_consumed_by_that_response() {
+        let mut t = CodexTranscript::new("unused.jsonl").with_prices(pricing::builtin_table());
+        t.ingest(r#"{"type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"exec_command"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}"#);
+        // A later item in the same streamed response must not consume c1.
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        let snapshot = record_response(&mut t, 1_000, 200, 10);
+        let initial = t.summary.context.sources();
+        assert_eq!(initial.len(), 1);
+        assert_eq!((initial[0].name.as_str(), initial[0].tokens), ("other", 1_000));
+
+        t.ingest(r#"{"type":"response_item","payload":{"type":"reasoning"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"c2","name":"apply_patch"}}"#);
+        t.ingest(
+            r#"{"timestamp":"2026-09-18T09:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c2"}}"#,
+        );
+        for snapshot in [
+            snapshot.as_str(),
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":null}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{}}}}"#,
+        ] {
+            t.ingest(snapshot);
+        }
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        assert_eq!(t.summary.context.sources(), initial);
+        record_response(&mut t, 1_300, 1_100, 20);
+        let sources = t.summary.context.sources();
+        let command = sources.iter().find(|s| s.name == "exec_command").unwrap();
+        assert_eq!((command.calls, command.tokens), (1, 290));
+        assert!(!sources.iter().any(|s| s.name == "apply_patch"));
+
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        record_response(&mut t, 1_350, 1_200, 5);
+        let sources = t.summary.context.sources();
+        let patch = sources.iter().find(|s| s.name == "apply_patch").unwrap();
+        assert_eq!((patch.calls, patch.tokens), (1, 30));
+        assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 1_350);
+        let prompt_cost = t.summary.cost_breakdown.input + t.summary.cost_breakdown.cache_read;
+        assert!(prompt_cost > 0.0);
+        assert!((sources.iter().map(|s| s.cost_usd).sum::<f64>() - prompt_cost).abs() < 1e-9);
+        assert_eq!((t.summary.usage.prompt(), t.summary.usage.output, t.summary.tool_calls), (3_650, 35, 2));
+    }
+
+    #[test]
+    fn tool_search_errors_are_not_part_of_the_requesting_responses_prompt() {
+        let mut t = CodexTranscript::new("unused.jsonl");
+        t.ingest(r#"{"type":"response_item","payload":{"type":"tool_search_call","call_id":"search"}}"#);
+        t.ingest(
+            r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call_output","call_id":"search"}}"#,
+        );
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        record_response(&mut t, 1_000, 0, 10);
+        let sources = t.summary.context.sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!((sources[0].name.as_str(), sources[0].tokens), ("other", 1_000));
+
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        record_response(&mut t, 1_060, 0, 10);
+        let sources = t.summary.context.sources();
+        let tool = sources.iter().find(|s| s.origin == ContextOrigin::Tool).unwrap();
+        assert_eq!((tool.calls, tool.tokens), (1, 50));
+    }
+
+    #[test]
+    fn identical_response_usage_is_not_a_snapshot_when_cumulative_usage_advances() {
+        let mut t = CodexTranscript::new("unused.jsonl").with_prices(pricing::builtin_table());
+        t.ingest(r#"{"type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"exec_command"}}"#);
+        t.ingest(r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}"#);
+        let snapshot = record_response(&mut t, 1_000, 0, 10);
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        t.ingest(&snapshot);
+        assert_eq!(t.summary.context.sources().len(), 1);
+        record_response(&mut t, 1_000, 0, 10);
+        let sources = t.summary.context.sources();
+        let command = sources.iter().find(|s| s.name == "exec_command").unwrap();
+        assert_eq!((command.calls, command.tokens), (1, 0));
+        assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 1_000);
+        assert!((sources.iter().map(|s| s.cost_usd).sum::<f64>() - t.summary.cost_breakdown.input).abs() < 1e-9);
+    }
+
+    #[test]
+    fn interrupted_responses_keep_results_for_the_next_consuming_response() {
+        for ending in ["turn_aborted", "error"] {
+            let mut t = CodexTranscript::new("unused.jsonl");
+            let snapshot = record_response(&mut t, 1_000, 0, 10);
+            t.ingest(r#"{"timestamp":"2026-09-18T09:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"exec_command"}}"#);
+            t.ingest(
+                r#"{"timestamp":"2026-09-18T09:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}"#,
+            );
+            t.ingest(&serde_json::json!({"type":"event_msg","payload":{"type":ending}}).to_string());
+            t.ingest(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#);
+            t.ingest(&snapshot);
+            t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+            record_response(&mut t, 1_110, 0, 10);
+            let sources = t.summary.context.sources();
+            let command = sources.iter().find(|s| s.name == "exec_command").unwrap();
+            assert_eq!((command.calls, command.tokens), (1, 100));
+        }
     }
 
     #[test]
@@ -857,5 +1323,352 @@ mod tests {
         assert_eq!(inf[0].duration_ms, Some(3_600));
         assert!(all.iter().all(|sp| sp.kind != SpanKind::Turn), "no task_started in this file");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn code_mode_records_nested_commands_and_patches_alongside_exec() {
+        // Sanitised 0.154.0 metadata; nested ids are independent of wrapper ids.
+        let path = std::env::temp_dir().join(format!("agent-top-codex-nested-{}.jsonl", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let mut t = CodexTranscript::new(&path);
+        for line in [
+            r#"{"timestamp":"2026-09-18T07:22:23.296Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_wrapper_1"}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:23.334Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1789716143334,"completed_at_ms":1789716143334,"item":{"type":"CommandExecution","id":"exec-command-1","source":"unified_exec_startup","status":"completed","exit_code":0}}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:23.348Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_wrapper_1"}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:30.281Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_wrapper_2"}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:30.288Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1789716150288,"completed_at_ms":1789716150288,"item":{"type":"FileChange","id":"exec-patch-1","status":"completed"}}}"#,
+            r#"{"timestamp":"2026-09-18T07:22:30.351Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_wrapper_2"}}"#,
+        ] {
+            writeln!(f, "{line}").unwrap();
+            t.refresh().unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
+        let tools: Vec<_> = t.summary.spans.iter().filter(|s| s.kind == SpanKind::Tool).collect();
+        assert_eq!(t.summary.tool_calls, 4, "two wrapper invocations and two actual nested tool invocations");
+        assert_eq!(
+            tools.iter().map(|s| (s.name.as_str(), s.duration_ms)).collect::<Vec<_>>(),
+            [("exec", Some(52)), ("exec_command", Some(0)), ("exec", Some(70)), ("apply_patch", Some(0)),]
+        );
+        assert!(tools.iter().all(|s| !s.error));
+        assert!(t.pending_tools.is_empty(), "completion items do not leave unmatched response calls");
+        // Only wrapper outputs contribute to context accounting.
+        record_response(&mut t, 1_000, 0, 0);
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        let usage = TokenUsage { input: 1_100, ..Default::default() };
+        let cost = crate::model::CostBreakdown { input: 1.0, ..Default::default() };
+        t.summary.context.response(&usage, &cost);
+        let sources = t.summary.context.sources();
+        for name in ["exec_command", "apply_patch"] {
+            let source = sources.iter().find(|s| s.name == name).unwrap();
+            assert_eq!((source.calls, source.tokens), (1, 50));
+        }
+        assert!(!sources.iter().any(|s| s.name == "exec"));
+
+        let mut baseline = crate::harness::ContextLedger::default();
+        baseline.response(&TokenUsage { input: 1_000, ..Default::default() }, &Default::default());
+        baseline.result("call_wrapper_1", ContextOrigin::Tool, "exec");
+        baseline.result("call_wrapper_2", ContextOrigin::Tool, "exec");
+        baseline.response(&usage, &cost);
+        for input in [1_150, 1_180] {
+            let usage = TokenUsage { input, ..Default::default() };
+            t.summary.context.response(&usage, &cost);
+            baseline.response(&usage, &cost);
+            let totals = |ledger: &crate::harness::ContextLedger| {
+                ledger
+                    .sources()
+                    .iter()
+                    .fold((0, 0, 0.0), |(calls, tokens, cost), s| (calls + s.calls, tokens + s.tokens, cost + s.cost_usd))
+            };
+            let (calls, tokens, cost) = totals(&t.summary.context);
+            let (old_calls, old_tokens, old_cost) = totals(&baseline);
+            assert_eq!((calls, tokens), (old_calls, old_tokens));
+            assert!((cost - old_cost).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn nested_output_sizes_use_decoded_text_not_inputs_or_duplicate_fields() {
+        use serde_json::json;
+        for (item, expected) in [
+            (
+                json!({"type":"CommandExecution","formatted_output":"é\n", "aggregated_output":"longer output", "stdout":"duplicate"}),
+                Some(3),
+            ),
+            (json!({"type":"CommandExecution","aggregated_output":"abcd","stdout":"duplicate","stderr":"duplicate"}), Some(4)),
+            (json!({"type":"CommandExecution","stdout":"ab","stderr":"c"}), Some(3)),
+            (json!({"type":"CommandExecution","command":["must not size this"]}), None),
+            (json!({"type":"FileChange","stdout":"ok\n","stderr":"!","changes":{"file":"not output"}}), Some(4)),
+            (json!({"type":"FileChange","stdout":"","stderr":""}), Some(0)),
+            (json!({"type":"FileChange","changes":{"file":"not output"}}), None),
+            (json!({"type":"McpToolCall","result":{"content":[{"type":"text","text":"abc"},{"type":"text","text":"d"}]}}), Some(4)),
+            (json!({"type":"McpToolCall","result":{"content":[{"type":"image","data":"not text"}]}}), None),
+            (json!({"type":"McpToolCall","result":{"content":[],"structuredContent":{"large":"result"}}}), None),
+            (json!({"type":"McpToolCall","error":{"message":"failed"}}), Some(6)),
+            (json!({"type":"DynamicToolCall","content_items":[{"type":"inputText","text":"abc"}],"arguments":"not output"}), Some(3)),
+            (json!({"type":"DynamicToolCall","content_items":[{"type":"inputImage","imageUrl":"not text"}]}), None),
+            (json!({"type":"DynamicToolCall","content_items":[{"type":"inputText","text":42}]}), None),
+            (json!({"type":"DynamicToolCall","error":"failed"}), Some(6)),
+        ] {
+            assert_eq!(nested_output_bytes(&item), expected, "{item}");
+        }
+    }
+
+    #[test]
+    fn code_mode_context_weights_children_without_changing_wrapper_totals() {
+        use serde_json::json;
+        for wrapper in ["exec", "wait"] {
+            for (command, patch, expected) in [
+                (Some("abc"), Some("d"), (30, 10)),
+                (Some("abc"), None, (20, 20)),
+                (None, Some("d"), (20, 20)),
+                (Some(""), Some(""), (20, 20)),
+                (Some(""), Some("d"), (0, 40)),
+            ] {
+                let mut t = CodexTranscript::new("unused.jsonl").with_prices(pricing::builtin_table());
+                t.ingest(r#"{"type":"turn_context","payload":{"model":"gpt-5.4-mini"}}"#);
+                t.ingest(
+                    &json!({"timestamp":"1970-01-01T00:00:01Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call","name":wrapper,"call_id":"wrapper"}})
+                    .to_string(),
+                );
+                for (item, start, end) in [
+                    (
+                        json!({"type":"CommandExecution","id":"exec-command","source":"unified_exec_startup","formatted_output":command}),
+                        1100,
+                        1200,
+                    ),
+                    (json!({"type":"FileChange","id":"exec-patch","stdout":patch}), 1300, 1400),
+                ] {
+                    let line = json!({"type":"event_msg","payload":{"type":"item_completed","item":item,
+                        "started_at_ms":start,"completed_at_ms":end}})
+                    .to_string();
+                    t.ingest(&line);
+                    t.ingest(&line);
+                }
+                t.ingest(r#"{"timestamp":"1970-01-01T00:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper"}}"#);
+                record_response(&mut t, 1_000, 0, 10);
+                assert_eq!(t.summary.context.sources().len(), 1);
+                t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+                let snapshot = record_response(&mut t, 1_050, 1_000, 10);
+                t.ingest(&snapshot);
+                let sources = t.summary.context.sources();
+                let command = sources.iter().find(|s| s.name == "exec_command").unwrap();
+                let patch = sources.iter().find(|s| s.name == "apply_patch").unwrap();
+                assert_eq!((command.tokens, patch.tokens), expected);
+                assert_eq!((command.calls, patch.calls, t.summary.tool_calls), (1, 1, 3));
+                assert!(!sources.iter().any(|s| s.name == wrapper));
+                assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 1_050);
+                let prompt_cost = t.summary.cost_breakdown.input + t.summary.cost_breakdown.cache_read;
+                assert!((sources.iter().map(|s| s.cost_usd).sum::<f64>() - prompt_cost).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn code_mode_context_weights_mcp_and_dynamic_results_and_preserves_errors() {
+        use serde_json::json;
+        let mut t = CodexTranscript::new("unused.jsonl");
+        t.ingest(r#"{"timestamp":"1970-01-01T00:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper"}}"#);
+        for item in [
+            json!({"id":"exec-mcp","type":"McpToolCall","tool":"lookup","server":"docs","result":{"content":[{"type":"text","text":"abc"}]}}),
+            json!({"id":"exec-dynamic","type":"DynamicToolCall","tool":"check","success":false,"content_items":[{"type":"inputText","text":"d"}]}),
+        ] {
+            t.ingest(
+                &json!({"type":"event_msg","payload":{"type":"item_completed","started_at_ms":1100,"completed_at_ms":1500,"item":item}})
+                    .to_string(),
+            );
+        }
+        t.ingest(r#"{"timestamp":"1970-01-01T00:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper"}}"#);
+        record_response(&mut t, 1_000, 0, 0);
+        t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+        record_response(&mut t, 1_040, 0, 0);
+        let sources = t.summary.context.sources();
+        let mcp = sources.iter().find(|s| s.name == "docs").unwrap();
+        let dynamic = sources.iter().find(|s| s.name == "check").unwrap();
+        assert_eq!((mcp.origin, mcp.calls, mcp.tokens), (ContextOrigin::Mcp, 1, 30));
+        assert_eq!((dynamic.origin, dynamic.calls, dynamic.tokens), (ContextOrigin::Tool, 1, 10));
+        assert!(t.summary.spans.iter().any(|s| s.name == "check" && s.error));
+    }
+
+    #[test]
+    fn code_mode_context_keeps_ambiguous_wrappers_and_survives_span_eviction() {
+        use serde_json::json;
+        let child = |id, kind, start, end| {
+            json!({
+                "item":{"id":id,"type":kind}, "started_at_ms":start, "completed_at_ms":end,
+            })
+        };
+        let patch = child("exec-patch", "FileChange", Some(1250), Some(1500));
+        let unknown = child("exec-unknown", "FutureTool", Some(1250), Some(1500));
+        for (children, expected, calls) in [
+            (vec![patch.clone()], "apply_patch", 1),
+            (vec![patch.clone(), patch.clone()], "apply_patch", 1),
+            (vec![patch.clone(), child("exec-patch-2", "FileChange", Some(1500), Some(1750))], "apply_patch", 2),
+            (vec![patch.clone(), unknown.clone()], "exec", 1),
+            (vec![unknown, patch], "exec", 1),
+            (vec![child("exec-patch", "FileChange", Some(500), Some(1500))], "exec", 1),
+            (vec![child("exec-patch", "FileChange", Some(1250), Some(2500))], "exec", 1),
+            (vec![child("exec-patch", "FileChange", None, Some(1500))], "exec", 1),
+            (vec![child("exec-patch", "FileChange", Some(1250), None)], "exec", 1),
+            (vec![], "exec", 1),
+        ] {
+            let mut t = CodexTranscript::new("unused.jsonl");
+            t.ingest(r#"{"timestamp":"1970-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"wrapper"}}"#);
+            for completion in children {
+                t.nested_tool_completed(&completion);
+            }
+            for i in 0..t.summary.spans.cap() {
+                t.summary.spans.open(format!("filler-{i}"), "tool".into(), SystemTime::UNIX_EPOCH, false);
+            }
+            if t.pending_tools["wrapper"].nested.iter().any(|n| n.id == "exec-patch") {
+                let before = t.summary.tool_calls;
+                t.nested_tool_completed(&child("exec-patch", "FileChange", Some(1250), Some(1500)));
+                assert_eq!(t.summary.tool_calls, before);
+            }
+            t.ingest(r#"{"timestamp":"1970-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper"}}"#);
+            record_response(&mut t, 1_000, 0, 0);
+            t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+            record_response(&mut t, 1_100, 0, 0);
+            let sources: Vec<_> = t.summary.context.sources().into_iter().filter(|s| s.origin != ContextOrigin::Other).collect();
+            assert_eq!(sources.len(), 1);
+            assert_eq!((sources[0].name.as_str(), sources[0].calls, sources[0].tokens), (expected, calls, 100));
+        }
+    }
+
+    #[test]
+    fn code_mode_context_rejects_overlapping_exec_and_wait_but_not_wait_agent() {
+        use serde_json::json;
+        for other in ["exec", "wait", "wait_agent"] {
+            for exec_first in [true, false] {
+                let mut t = CodexTranscript::new("unused.jsonl");
+                for (id, name) in [("wrapper", "exec"), ("other", other)] {
+                    t.ingest(
+                        &json!({"timestamp":"1970-01-01T00:00:01.000Z", "type":"response_item",
+                        "payload":{"type":"function_call","name":name,"call_id":id}})
+                        .to_string(),
+                    );
+                }
+                t.nested_tool_completed(&json!({"started_at_ms":1250,"completed_at_ms":1500,
+                    "item":{"id":"exec-patch","type":"FileChange"}}));
+                for id in if exec_first { ["wrapper", "other"] } else { ["other", "wrapper"] } {
+                    t.ingest(
+                        &json!({"timestamp":"1970-01-01T00:00:02.000Z", "type":"response_item",
+                        "payload":{"type":"function_call_output","call_id":id}})
+                        .to_string(),
+                    );
+                }
+                record_response(&mut t, 1_000, 0, 0);
+                t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+                record_response(&mut t, 1_100, 0, 0);
+                let sources = t.summary.context.sources();
+                assert_eq!(sources.iter().any(|s| s.name == "apply_patch"), other == "wait_agent");
+                assert_eq!(sources.iter().map(|s| s.calls).sum::<u64>(), 2);
+                assert_eq!(sources.iter().map(|s| s.tokens).sum::<u64>(), 1_100);
+            }
+        }
+    }
+
+    #[test]
+    fn unfinished_wrappers_do_not_block_context_attribution_in_later_turns() {
+        use serde_json::json;
+        for ending in ["task_complete", "turn_aborted", "error"] {
+            let mut t = CodexTranscript::new("unused.jsonl");
+            for line in [
+                json!({"timestamp":"1970-01-01T00:00:01.000Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call","name":"exec","call_id":"old"}}),
+                json!({"timestamp":"1970-01-01T00:00:02.000Z","type":"event_msg","payload":{"type":ending}}),
+                json!({"timestamp":"1970-01-01T00:00:03.000Z","type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"timestamp":"1970-01-01T00:00:03.100Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call","name":"exec","call_id":"new"}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","started_at_ms":3200,"completed_at_ms":3500,
+                    "item":{"type":"FileChange","id":"exec-patch"}}}),
+                json!({"timestamp":"1970-01-01T00:00:04.000Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call_output","call_id":"new"}}),
+                json!({"timestamp":"1970-01-01T00:00:05.000Z","type":"response_item",
+                    "payload":{"type":"custom_tool_call_output","call_id":"old"}}),
+            ] {
+                t.ingest(&line.to_string());
+            }
+            record_response(&mut t, 1_000, 0, 0);
+            t.ingest(r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#);
+            record_response(&mut t, 1_100, 0, 0);
+            let sources = t.summary.context.sources();
+            assert_eq!(sources.len(), 3);
+            for name in ["apply_patch", "exec"] {
+                let source = sources.iter().find(|s| s.name == name).unwrap();
+                assert_eq!((source.calls, source.tokens), (1, 50));
+            }
+        }
+    }
+
+    #[test]
+    fn code_mode_completion_metadata_preserves_timing_names_and_errors() {
+        use serde_json::json;
+        let mut t = CodexTranscript::new("unused.jsonl");
+        for (item, name, error) in [
+            (json!({"type":"CommandExecution","source":"unified_exec_startup","exit_code":1}), "exec_command", true),
+            (json!({"type":"CommandExecution","source":"unified_exec_interaction","status":"completed"}), "write_stdin", false),
+            (json!({"type":"FileChange","status":"declined"}), "apply_patch", true),
+            (json!({"type":"McpToolCall","tool":"search","status":"failed"}), "search", true),
+            (json!({"type":"DynamicToolCall","tool":"lookup","success":false}), "lookup", true),
+        ] {
+            let mut item = item;
+            item["id"] = json!(format!("exec-{name}"));
+            let line = json!({
+                "type":"event_msg", "timestamp":"2026-09-18T07:22:25.000Z",
+                "payload":{"type":"item_completed", "started_at_ms":1000, "completed_at_ms":1250, "item":item},
+            })
+            .to_string();
+            let before = t.summary.tool_calls;
+            t.ingest(&line);
+            let span = t.summary.spans.iter().next_back().unwrap();
+            assert_eq!((span.name.as_str(), span.duration_ms, span.error), (name, Some(250), error));
+            assert_eq!(span.started_at, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+            // Replayed completions must not count twice.
+            t.ingest(&line);
+            assert_eq!(t.summary.tool_calls, before + 1);
+        }
+        assert_eq!(t.summary.tool_calls, 5);
+        assert_eq!(t.summary.spans.len(), 5);
+        assert!(t.inference.is_none(), "nested results are not new model requests");
+    }
+
+    #[test]
+    fn completion_items_do_not_duplicate_direct_calls_or_guess_unknown_tools() {
+        use serde_json::json;
+        let mut t = CodexTranscript::new("unused.jsonl");
+        t.ingest(r#"{"timestamp":"2026-09-18T07:22:23.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_direct"}}"#);
+        for item in [
+            json!({"type":"CommandExecution","id":"call_direct","source":"unified_exec_startup"}),
+            json!({"type":"FileChange","id":"call_patch"}),
+            json!({"type":"CommandExecution","id":"exec-user","source":"user_shell"}),
+            json!({"type":"CommandExecution","id":"exec-unknown","source":"new_source"}),
+            json!({"type":"UnknownTool","id":"exec-future"}),
+            json!({"type":"DynamicToolCall","id":"exec-missing-name"}),
+            json!({"type":"McpToolCall","id":"exec-empty-name","tool":""}),
+            json!({"type":"FileChange","id":"exec-"}),
+            json!({"type":"FileChange"}),
+        ] {
+            t.ingest(
+                &json!({
+                    "type":"event_msg", "payload":{"type":"item_completed", "started_at_ms":1000, "completed_at_ms":1250, "item":item},
+                })
+                .to_string(),
+            );
+        }
+        for (start, end) in [(json!(null), json!(1250)), (json!(1000), json!(null)), (json!(1250), json!(1000))] {
+            t.ingest(
+                &json!({
+                    "type":"event_msg", "payload":{"type":"item_completed", "started_at_ms":start, "completed_at_ms":end,
+                        "item":{"type":"FileChange","id":"exec-no-timing"}},
+                })
+                .to_string(),
+            );
+        }
+        t.ingest(r#"{"timestamp":"2026-09-18T07:22:24.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_direct"}}"#);
+        assert_eq!(t.summary.tool_calls, 1);
+        let tools: Vec<_> = t.summary.spans.iter().filter(|s| s.kind == SpanKind::Tool).collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].duration_ms, Some(1000));
     }
 }

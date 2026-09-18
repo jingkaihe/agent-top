@@ -3,6 +3,31 @@
 use agent_top_core::pricing::{Origin, Table};
 use agent_top_core::{Agent, AgentState, ProcNode, Snapshot};
 
+/// The same session identity is used for labels and name sorting.
+pub fn session_name(a: &Agent) -> String {
+    let Some(info) = &a.subagent else { return a.name.clone() };
+    match (&info.nickname, &info.role) {
+        (Some(name), Some(role)) => format!("{name} ({role})"),
+        (Some(name), None) => name.clone(),
+        (None, Some(role)) => format!("{} ({role})", a.name),
+        (None, None) => a.name.clone(),
+    }
+}
+
+/// A row's name in a table: nested under its parent when the parent is in the
+/// same listing, and marked when it is not.
+pub fn nested_name(a: &Agent, depth: usize, width: usize) -> String {
+    let prefix = if depth > 0 {
+        format!("{}↳ ", "  ".repeat(depth.saturating_sub(1).min(8)))
+    } else if a.subagent.is_some() {
+        // Its parent may be missing, ambiguous or hidden by the stopped filter.
+        "[subagent] ".into()
+    } else {
+        String::new()
+    };
+    truncate(&format!("{prefix}{}", session_name(a)), width)
+}
+
 /// CPU and memory belong to the process, and several conversations can share
 /// one. Showing 0.0% on the rows that do not own it would read as an idle
 /// agent rather than as "counted on the row above".
@@ -130,10 +155,12 @@ pub fn plain_table(snap: &Snapshot) -> String {
         "{:<24} {:<8} {:<8} {:>7} {:<14} {:>8} {:>8} {:>6} {:>7} {:>5} {:>5} {:>4} {:>7}\n",
         "AGENT", "HARNESS", "STATE", "PID", "MODEL", "TOKENS", "COST", "CPU%", "MEM", "TOOLS", "PROCS", "MCP", "AGE"
     ));
-    for a in &snap.agents {
+    // Subagent sessions follow their parent, as in the live table.
+    for (i, depth) in crate::app::SessionTree::new(&snap.agents).order {
+        let a = &snap.agents[i];
         out.push_str(&format!(
             "{:<24} {:<8} {:<8} {:>7} {:<14} {:>8} {:>8} {:>6} {:>7} {:>5} {:>5} {:>4} {:>7}\n",
-            truncate(&a.name, 24),
+            nested_name(a, depth, 24),
             a.harness.label(),
             a.state.label(),
             a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
@@ -152,7 +179,7 @@ pub fn plain_table(snap: &Snapshot) -> String {
     if !warned.is_empty() {
         out.push_str("\nWARNING\n");
         for a in warned {
-            out.push_str(&format!("  {}: {}\n", a.name, a.parse_warning.as_deref().unwrap_or_default()));
+            out.push_str(&format!("  {}: {}\n", session_name(a), a.parse_warning.as_deref().unwrap_or_default()));
         }
     }
     let with_servers: Vec<&Agent> = snap.agents.iter().filter(|a| !a.mcp_servers.is_empty()).collect();
@@ -169,7 +196,7 @@ pub fn plain_table(snap: &Snapshot) -> String {
                 };
                 out.push_str(&format!(
                     "  {:<24} {:<20} {:>7} {:>6} calls {:>4} err  {}{}\n",
-                    truncate(&a.name, 24),
+                    truncate(&session_name(a), 24),
                     truncate(&m.name, 20),
                     pid,
                     m.calls,
@@ -193,7 +220,7 @@ pub fn plain_table(snap: &Snapshot) -> String {
                 let cost = if a.price_source.is_none() { "-".to_string() } else { format!("${:.2}", c.cost_usd) };
                 out.push_str(&format!(
                     "  {:<24} {:<22} {:>5} calls {:>7} tokens {:>9}\n",
-                    truncate(&a.name, 24),
+                    truncate(&session_name(a), 24),
                     truncate(&label, 22),
                     calls,
                     tokens(c.tokens),
@@ -235,7 +262,7 @@ pub fn plain_table(snap: &Snapshot) -> String {
             let reached = a.rate_limit.as_ref().map(|rl| rl.reached).unwrap_or(false);
             out.push_str(&format!(
                 "  {:<24} {:>3.0}% of its {} window{}\n",
-                truncate(&a.name, 24),
+                truncate(&session_name(a), 24),
                 w.used_percent,
                 crate::ui::window_label(w.window_minutes),
                 if reached { "  LIMIT REACHED" } else { "" }
