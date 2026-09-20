@@ -469,6 +469,7 @@ impl OpenCodeTranscript {
                 ids.push((row_id.clone(), is_sub));
 
                 let usage = TokenUsage {
+                    cache_write_unsplit: 0,
                     input: r.get::<_, i64>(5)? as u64,
                     output: (r.get::<_, i64>(6)? + r.get::<_, i64>(7)?) as u64, // output + reasoning
                     cache_read: r.get::<_, i64>(8)? as u64,
@@ -753,6 +754,7 @@ fn context_ledger(conn: &Connection, session_id: &str, servers: &[String]) -> ru
     while let Some(r) = rows.next()? {
         let id: String = r.get(0)?;
         let usage = TokenUsage {
+            cache_write_unsplit: 0,
             input: n(r.get(1)?),
             output: n(r.get(2)?) + n(r.get(3)?),
             cache_read: n(r.get(4)?),
@@ -794,6 +796,7 @@ fn scaled(b: CostBreakdown, total: f64) -> CostBreakdown {
         input: b.input * k,
         cache_write_5m: b.cache_write_5m * k,
         cache_write_1h: b.cache_write_1h * k,
+        cache_write_unsplit: b.cache_write_unsplit * k,
         cache_read: b.cache_read * k,
         output: b.output * k,
         web_search: b.web_search * k,

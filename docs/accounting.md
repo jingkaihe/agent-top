@@ -44,8 +44,9 @@ Kodelet records cumulative usage, not per-response usage, so it has no
 context-by-source ledger. Its Responses input counter includes cache reads;
 the adapter separates those once, while Chat Completions and Anthropic input
 counters already exclude them. Cache creation tokens and costs have no saved
-TTL split: the JSON `cache_write_5m` slot carries the unsplit aggregate, and the
-UI labels it `cache write`. Recorded costs are estimates from the harness,
+TTL split, so they are counted in `cache_write_unsplit` rather than either
+priced slot, and the UI labels the row `cache write` with no rate: the TTL is
+what would choose between the five-minute and one-hour rate. Recorded costs are estimates from the harness,
 not proof of an invoice or subscription charge. Child sessions contribute
 their own usage once, never both separately and folded into a parent.
 

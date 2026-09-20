@@ -92,17 +92,21 @@ pub enum Activity {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct TokenUsage {
     pub input: u64,
-    /// Five-minute writes, or the unsplit aggregate when the harness retains
-    /// no TTL breakdown (Kodelet). Such rows must not claim a five-minute TTL.
     pub cache_write_5m: u64,
     pub cache_write_1h: u64,
+    /// Cache creation a harness recorded without the TTL that decides its
+    /// rate. No price table can cover it: charging either TTL's rate would be
+    /// a guess about a lifetime nobody wrote down. Only a harness that reports
+    /// its own costs can put a number against these tokens.
+    #[serde(default)]
+    pub cache_write_unsplit: u64,
     pub cache_read: u64,
     pub output: u64,
 }
 
 impl TokenUsage {
     pub fn cache_write(&self) -> u64 {
-        self.cache_write_5m + self.cache_write_1h
+        self.cache_write_5m + self.cache_write_1h + self.cache_write_unsplit
     }
 
     /// Everything the model consumed or produced. This is the "TOKENS" column.
@@ -130,6 +134,7 @@ impl TokenUsage {
         self.input += other.input;
         self.cache_write_5m += other.cache_write_5m;
         self.cache_write_1h += other.cache_write_1h;
+        self.cache_write_unsplit += other.cache_write_unsplit;
         self.cache_read += other.cache_read;
         self.output += other.output;
     }
@@ -138,6 +143,7 @@ impl TokenUsage {
         self.input = self.input.saturating_sub(other.input);
         self.cache_write_5m = self.cache_write_5m.saturating_sub(other.cache_write_5m);
         self.cache_write_1h = self.cache_write_1h.saturating_sub(other.cache_write_1h);
+        self.cache_write_unsplit = self.cache_write_unsplit.saturating_sub(other.cache_write_unsplit);
         self.cache_read = self.cache_read.saturating_sub(other.cache_read);
         self.output = self.output.saturating_sub(other.output);
     }
@@ -523,9 +529,12 @@ impl RateLimit {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct CostBreakdown {
     pub input: f64,
-    /// Follows `TokenUsage::cache_write_5m`, including its unsplit-write case.
     pub cache_write_5m: f64,
     pub cache_write_1h: f64,
+    /// What a harness recorded against `TokenUsage::cache_write_unsplit`.
+    /// Always zero when the cost came from a price table.
+    #[serde(default)]
+    pub cache_write_unsplit: f64,
     pub cache_read: f64,
     pub output: f64,
     /// Server-side web searches, billed per search on top of the tokens.
@@ -534,13 +543,14 @@ pub struct CostBreakdown {
 
 impl CostBreakdown {
     pub fn total(&self) -> f64 {
-        self.input + self.cache_write_5m + self.cache_write_1h + self.cache_read + self.output + self.web_search
+        self.input + self.cache_write_5m + self.cache_write_1h + self.cache_write_unsplit + self.cache_read + self.output + self.web_search
     }
 
     pub fn add(&mut self, o: &CostBreakdown) {
         self.input += o.input;
         self.cache_write_5m += o.cache_write_5m;
         self.cache_write_1h += o.cache_write_1h;
+        self.cache_write_unsplit += o.cache_write_unsplit;
         self.cache_read += o.cache_read;
         self.output += o.output;
         self.web_search += o.web_search;
@@ -550,6 +560,7 @@ impl CostBreakdown {
         self.input -= o.input;
         self.cache_write_5m -= o.cache_write_5m;
         self.cache_write_1h -= o.cache_write_1h;
+        self.cache_write_unsplit -= o.cache_write_unsplit;
         self.cache_read -= o.cache_read;
         self.output -= o.output;
         self.web_search -= o.web_search;
@@ -735,12 +746,12 @@ mod usage_tests {
 
     #[test]
     fn cache_hit_rate_is_reads_over_the_prompt() {
-        let u = TokenUsage { input: 200, cache_read: 800, cache_write_5m: 0, cache_write_1h: 0, output: 50 };
+        let u = TokenUsage { input: 200, cache_read: 800, output: 50, ..Default::default() };
         // Prompt is 1000 (output excluded); 800 of it from cache.
         assert_eq!(u.prompt(), 1000);
         assert!((u.cache_hit_rate().unwrap() - 0.8).abs() < 1e-9);
         // A cache write counts as prompt input, not as a hit.
-        let u = TokenUsage { input: 100, cache_read: 0, cache_write_5m: 900, cache_write_1h: 0, output: 0 };
+        let u = TokenUsage { input: 100, cache_write_5m: 900, ..Default::default() };
         assert_eq!(u.cache_hit_rate(), Some(0.0));
         // Nothing to judge.
         assert_eq!(TokenUsage::default().cache_hit_rate(), None);

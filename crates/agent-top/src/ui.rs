@@ -924,15 +924,13 @@ fn agent_facts(a: &Agent, now: SystemTime, theme: &Theme) -> Text<'static> {
     lines.extend(vec![
         cost_row("  input", u.input, price.map(|p| p.input), b.input, theme),
         cost_row("  cache rd", u.cache_read, price.map(|p| p.cache_read), b.cache_read, theme),
-        cost_row(
-            if a.harness == agent_top_core::Harness::Kodelet { "  cache write" } else { "  cache wr 5m" },
-            u.cache_write_5m,
-            price.map(|p| p.cache_write_5m),
-            b.cache_write_5m,
-            theme,
-        ),
     ]);
-    if a.harness != agent_top_core::Harness::Kodelet {
+    // Writes whose TTL was never recorded are one row with no rate, because
+    // the lifetime is what would pick between the two rates below.
+    if u.cache_write_unsplit > 0 {
+        lines.push(cost_row("  cache write", u.cache_write_unsplit, None, b.cache_write_unsplit, theme));
+    } else {
+        lines.push(cost_row("  cache wr 5m", u.cache_write_5m, price.map(|p| p.cache_write_5m), b.cache_write_5m, theme));
         lines.push(cost_row("  cache wr 1h", u.cache_write_1h, price.map(|p| p.cache_write_1h), b.cache_write_1h, theme));
     }
     lines.push(cost_row("  output", u.output, price.map(|p| p.output), b.output, theme));
@@ -1520,7 +1518,7 @@ mod tests {
             cwd: None,
             model: Some("claude-fable-5-1".into()),
             harness_version: Some("2.1.259".into()),
-            usage: TokenUsage { input: 2, cache_write_5m: 9_900, cache_write_1h: 0, cache_read: 22_000, output: 250 },
+            usage: TokenUsage { input: 2, cache_write_5m: 9_900, cache_read: 22_000, output: 250, ..Default::default() },
             cost_usd: 1.42,
             cost_breakdown: agent_top_core::CostBreakdown { output: 1.42, ..Default::default() },
             price_source: Some(agent_top_core::PriceSource::Builtin),
@@ -1657,8 +1655,8 @@ mod tests {
             a.harness = agent_top_core::Harness::Kodelet;
             a.price_source = Some(agent_top_core::PriceSource::Harness);
             a.tool_calls_lower_bound = true;
-            a.usage.cache_write_5m = 1_000;
-            a.cost_breakdown.cache_write_5m = 0.12;
+            a.usage.cache_write_unsplit = 1_000;
+            a.cost_breakdown.cache_write_unsplit = 0.12;
             a.cost_usd = 0.12;
         }
         let mut app = App::new(snapshot(family));
@@ -1979,10 +1977,9 @@ mod tests {
         a.cost_breakdown = agent_top_core::CostBreakdown {
             input: 0.00002,
             cache_write_5m: 0.12375,
-            cache_write_1h: 0.0,
             cache_read: 0.0055,
             output: 0.0125,
-            web_search: 0.0,
+            ..Default::default()
         };
         a.cost_usd = a.cost_breakdown.total();
         let mut app = App::new(snapshot(vec![a]));
@@ -2172,7 +2169,7 @@ mod tests {
     fn detail_pane_shows_cache_efficiency() {
         // A wasteful session: a big prompt, almost none of it from cache.
         let mut a = agent("cold-cache", Vec::new());
-        a.usage = TokenUsage { input: 90_000, cache_read: 10_000, cache_write_5m: 0, cache_write_1h: 0, output: 500 };
+        a.usage = TokenUsage { input: 90_000, cache_read: 10_000, output: 500, ..Default::default() };
         let mut app = App::new(snapshot(vec![a]));
         app.show_detail = true;
         app.detail = DetailView::Tree;
@@ -2182,7 +2179,7 @@ mod tests {
 
         // A healthy session says the percentage without the warning.
         let mut a = agent("warm-cache", Vec::new());
-        a.usage = TokenUsage { input: 10_000, cache_read: 90_000, cache_write_5m: 0, cache_write_1h: 0, output: 500 };
+        a.usage = TokenUsage { input: 10_000, cache_read: 90_000, output: 500, ..Default::default() };
         let mut app = App::new(snapshot(vec![a]));
         app.show_detail = true;
         app.detail = DetailView::Tree;

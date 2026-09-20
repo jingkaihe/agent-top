@@ -654,7 +654,7 @@ mod tests {
             cwd: None,
             model: None,
             harness_version: None,
-            usage: TokenUsage { input: 10, cache_write_5m: 0, cache_write_1h: 0, cache_read: 500_000, output },
+            usage: TokenUsage { input: 10, cache_read: 500_000, output, ..Default::default() },
             cost_usd: 0.0,
             cost_breakdown: Default::default(),
             price_source: None,

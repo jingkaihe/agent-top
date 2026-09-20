@@ -523,8 +523,11 @@ fn accounting(usage: &Value, responses: bool, summary: &mut SessionSummary) {
         input: if responses { count("inputTokens").saturating_sub(cached) } else { count("inputTokens") },
         output: count("outputTokens"),
         cache_read: cached,
-        cache_write_5m: count("cacheCreationInputTokens"),
+        cache_write_5m: 0,
         cache_write_1h: 0,
+        // One cumulative counter with no TTL breakdown saved, so it cannot go
+        // in either priced bucket.
+        cache_write_unsplit: count("cacheCreationInputTokens"),
     };
     let mut costs = [0.0; 4];
     let mut recorded = false;
@@ -545,7 +548,7 @@ fn accounting(usage: &Value, responses: bool, summary: &mut SessionSummary) {
         }
     }
     summary.cost_breakdown =
-        CostBreakdown { input: costs[0], output: costs[1], cache_read: costs[2], cache_write_5m: costs[3], ..Default::default() };
+        CostBreakdown { input: costs[0], output: costs[1], cache_read: costs[2], cache_write_unsplit: costs[3], ..Default::default() };
     summary.cost_usd = summary.cost_breakdown.total();
     summary.price_source = recorded.then_some(PriceSource::Harness);
 }
@@ -779,7 +782,7 @@ mod tests {
             let summary = tracker.summary();
             assert_eq!(
                 summary.usage,
-                TokenUsage { input: expected_input, output: 20, cache_read: 60, cache_write_5m: 10, cache_write_1h: 0 }
+                TokenUsage { input: expected_input, output: 20, cache_read: 60, cache_write_unsplit: 10, ..Default::default() }
             );
             assert!((summary.cost_usd - 0.37).abs() < 1e-12);
             assert_eq!(summary.price_source, Some(PriceSource::Harness));
