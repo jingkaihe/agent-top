@@ -775,6 +775,7 @@ fn price_basis(a: &Agent) -> String {
     match a.price_source {
         Some(agent_top_core::PriceSource::Builtin) => "list price, built-in table".into(),
         Some(agent_top_core::PriceSource::UserFile) => "your price file".into(),
+        Some(agent_top_core::PriceSource::Harness) if a.unpriced_tokens > 0 => "harness recorded no cost for some tokens".into(),
         Some(agent_top_core::PriceSource::Harness) => "harness-reported cost".into(),
         None if a.unpriced_tokens > 0 => "no price for this model".into(),
         None => String::new(),
@@ -1267,8 +1268,10 @@ fn context_by_source(a: &Agent, theme: &Theme) -> Vec<Line<'static>> {
             ContextOrigin::Other => ("prompts & replies".to_string(), Style::default().fg(theme.dim)),
         };
         let calls = if c.origin == ContextOrigin::Other { "-".to_string() } else { c.calls.to_string() };
-        // No price for the model: the tokens are real, the cost is not knowable.
-        let cost = if a.price_source.is_none() { "-".to_string() } else { format!("${:.2}", c.cost_usd) };
+        // The tokens are real whether or not the cost is knowable: a model
+        // with no price, or a harness that priced the session without saying
+        // how it divides, leaves these rows at zero.
+        let cost = if c.cost_usd > 0.0 { format!("${:.2}", c.cost_usd) } else { "-".to_string() };
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<18} ", truncate(&label, 18)), style),
             Span::styled(format!("{calls:>5} "), Style::default().fg(theme.dim)),
@@ -1685,6 +1688,28 @@ mod tests {
         a.session_id = Some("20260919T090026-0123456789abcdef".into());
         let facts = agent_facts(&a, SystemTime::now(), &Theme::new(ThemeMode::Dark, true)).to_string();
         assert!(facts.contains("agent-top trace --session 20260919T090026-0123456789abcdef -o trace.json"), "{facts}");
+    }
+
+    #[test]
+    fn a_harness_priced_row_never_borrows_the_tables_name_or_its_rates() {
+        let theme = Theme::new(ThemeMode::Dark, true);
+        let mut a = codex_family().remove(0);
+        a.model = Some("claude-sonnet-5".into()); // in the built-in table
+        a.price_source = Some(agent_top_core::PriceSource::Harness);
+        a.usage = TokenUsage { input: 100, output: 20, ..Default::default() };
+
+        let facts = agent_facts(&a, SystemTime::now(), &theme).to_string();
+        assert!(facts.contains("harness-reported cost"), "{facts}");
+        assert!(!facts.contains("list price"), "{facts}");
+        assert!(!facts.lines().any(|l| l.contains("input") && l.contains("2.00")), "no table rate on a harness-priced row: {facts}");
+
+        // The harness recorded nothing for these tokens. The row is still the
+        // harness's, and the pane says the figure is missing rather than
+        // naming a table that priced nothing.
+        a.unpriced_tokens = 120;
+        let facts = agent_facts(&a, SystemTime::now(), &theme).to_string();
+        assert!(facts.contains("harness recorded no cost for some tokens"), "{facts}");
+        assert!(!facts.contains("list price"), "{facts}");
     }
 
     #[test]

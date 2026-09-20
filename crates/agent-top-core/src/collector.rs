@@ -284,6 +284,9 @@ impl Collector {
                     usage: summary.usage,
                     cost_usd: summary.cost_usd,
                     cost_breakdown: summary.cost_breakdown,
+                    // Only a harness that prices from the table leaves this
+                    // empty; one that does its own accounting sets it itself,
+                    // so the lookup below never renames someone else's figure.
                     price_source: summary
                         .price_source
                         .or_else(|| summary.model.as_deref().and_then(|m| crate::pricing::table().source_for(m))),

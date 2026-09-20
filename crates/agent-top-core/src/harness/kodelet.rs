@@ -530,7 +530,6 @@ fn accounting(usage: &Value, responses: bool, summary: &mut SessionSummary) {
         cache_write_unsplit: count("cacheCreationInputTokens"),
     };
     let mut costs = [0.0; 4];
-    let mut recorded = false;
     for (i, (key, tokens)) in [
         ("inputCost", summary.usage.input),
         ("outputCost", summary.usage.output),
@@ -542,7 +541,6 @@ fn accounting(usage: &Value, responses: bool, summary: &mut SessionSummary) {
     {
         if let Some(cost) = usage.get(key).and_then(Value::as_f64).filter(|cost| cost.is_finite() && *cost >= 0.0) {
             costs[i] = cost;
-            recorded = true;
         } else {
             summary.unpriced_tokens += tokens;
         }
@@ -550,7 +548,11 @@ fn accounting(usage: &Value, responses: bool, summary: &mut SessionSummary) {
     summary.cost_breakdown =
         CostBreakdown { input: costs[0], output: costs[1], cache_read: costs[2], cache_write_unsplit: costs[3], ..Default::default() };
     summary.cost_usd = summary.cost_breakdown.total();
-    summary.price_source = recorded.then_some(PriceSource::Harness);
+    // Kodelet's own figures are the only prices this row can have, whether or
+    // not it recorded one. Leaving the source empty would let the collector
+    // fill it in from the price table, which never priced anything here;
+    // `unpriced_tokens` is what says a figure is missing.
+    summary.price_source = Some(PriceSource::Harness);
 }
 
 fn read_tools(conn: &Connection, id: &str, fork: bool, summary: &mut SessionSummary) -> anyhow::Result<HashMap<String, bool>> {
@@ -807,8 +809,11 @@ mod tests {
         let mut tracker = fixture.tracker("missing");
         tracker.refresh_all().unwrap();
         assert_eq!(tracker.summary().unpriced_tokens, 120);
-        assert_eq!(tracker.summary().price_source, None);
         assert_eq!(tracker.summary().cost_usd, 0.0);
+        // The model is in the built-in table, so an empty source here would let
+        // the collector name that table as this row's price. Kodelet says the
+        // row is its own either way, and `unpriced_tokens` says what is missing.
+        assert_eq!(tracker.summary().price_source, Some(PriceSource::Harness));
 
         fixture
             .conn
