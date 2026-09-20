@@ -401,13 +401,19 @@ not a bill.
 
 ## Supported harnesses
 
+One adapter per harness, each producing the same row, so the table, the report,
+the trace and the snapshot look the same whichever tool wrote the transcript.
+[Harness support](https://agenttop.dev/harnesses/) has how each one is
+attributed, how its MCP calls are counted, and what happens when a format
+drifts.
+
 | Harness | Discovery | Tokens and cost | State |
 |---|---|---|---|
 | Claude Code | process table + `~/.claude/sessions/<pid>.json` (exact) | transcript usage, priced per model, subagent transcripts folded into their parent | harness-reported |
 | Codex CLI / app-server | process table + the rollout files the process holds open (exact on macOS and Linux; `cwd` heuristic elsewhere) | transcript usage, priced per model (OpenAI list prices) | transcript events |
 | Gemini CLI | process table + `cwd` heuristic (the CLI keeps no registry and does not hold its transcript open) | transcript usage, priced per model, subagent transcripts folded into their parent | transcript events |
 | OpenCode | process table + `cwd` heuristic; reads its SQLite session store read-only | tokens and OpenCode's own computed cost, subagent sessions folded into their parent | transcript times |
-| Kodelet | local daemon/runner metadata, verified against the process table; reads SQLite read-only | normalized cumulative usage and Kodelet's recorded costs; subagent and code-search child sessions remain separate | durable run/turn receipts |
+| Kodelet | process table + Kodelet's own runner and turn records, matched on host, pid and heartbeat (exact); `cwd` heuristic otherwise; reads its SQLite store read-only | cumulative tokens and Kodelet's own recorded cost; child sessions keep their own usage under their parent; tool count is a lower bound | run and turn receipts |
 | Aider, Copilot CLI, cursor-agent | process table only | not yet | CPU heuristic |
 
 ## Install
