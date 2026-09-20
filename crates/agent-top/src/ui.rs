@@ -957,9 +957,12 @@ fn agent_facts(a: &Agent, now: SystemTime, theme: &Theme) -> Text<'static> {
         lines.push(kv("transcript", tilde(p), theme));
     }
     if let Some(id) = &a.session_id {
-        // Kodelet IDs begin with a date shared by all sessions that day.
-        // Other harnesses use a short prefix that the command can resolve.
-        let short = if a.harness == agent_top_core::Harness::Kodelet { id.clone() } else { id.chars().take(8).collect() };
+        // How much of the id `agent-top trace` needs is a property of the
+        // harness's id format, which `Harness::session_id_prefix_len` holds.
+        let short: String = match a.harness.session_id_prefix_len() {
+            Some(n) => id.chars().take(n).collect(),
+            None => id.clone(),
+        };
         lines.push(kv("export", format!("agent-top trace --session {short} -o trace.json"), theme));
     }
     Text::from(lines)
@@ -1684,6 +1687,19 @@ mod tests {
         a.session_id = Some("20260919T090026-0123456789abcdef".into());
         let facts = agent_facts(&a, SystemTime::now(), &Theme::new(ThemeMode::Dark, true)).to_string();
         assert!(facts.contains("agent-top trace --session 20260919T090026-0123456789abcdef -o trace.json"), "{facts}");
+    }
+
+    #[test]
+    fn other_harnesses_export_a_prefix_and_a_short_id_is_never_cut_past_its_end() {
+        let theme = Theme::new(ThemeMode::Dark, true);
+        let mut a = codex_family().remove(0);
+        a.session_id = Some("0123456789abcdef-tail".into());
+        let facts = agent_facts(&a, SystemTime::now(), &theme).to_string();
+        assert!(facts.contains("--session 01234567 -o"), "{facts}");
+
+        a.session_id = Some("abc".into());
+        let facts = agent_facts(&a, SystemTime::now(), &theme).to_string();
+        assert!(facts.contains("--session abc -o"), "{facts}");
     }
 
     #[test]

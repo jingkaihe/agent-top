@@ -33,6 +33,24 @@ impl Harness {
             Harness::Unknown => "unknown",
         }
     }
+
+    /// How much of a session id identifies it to `agent-top trace --session`,
+    /// which matches a prefix against the ids of every harness and fails when
+    /// one matches more than one session. `None` means the whole id is needed:
+    /// Kodelet's begin with a date that every session started that day shares.
+    pub fn session_id_prefix_len(self) -> Option<usize> {
+        match self {
+            Harness::Kodelet => None,
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Gemini
+            | Harness::OpenCode
+            | Harness::Aider
+            | Harness::Copilot
+            | Harness::Cursor
+            | Harness::Unknown => Some(8),
+        }
+    }
 }
 
 /// Coarse lifecycle state, in the htop sense.
